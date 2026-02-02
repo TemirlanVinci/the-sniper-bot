@@ -232,6 +232,7 @@ impl StreamClient for BinanceClient {
 
         println!("Starting WebSocket task for: {}", symbol);
 
+        let symbol = symbol.to_string();
         // Spawn a detached background task
         tokio::spawn(async move {
             match connect_async(url).await {
