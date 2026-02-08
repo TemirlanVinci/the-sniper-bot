@@ -1,3 +1,4 @@
+// src/strategies/scalper.rs
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker};
 use anyhow::Result;
@@ -26,7 +27,6 @@ impl Strategy for SimpleScalper {
     }
 
     async fn init(&mut self) -> Result<()> {
-        println!("Strategy {} initialized for {}", self.name(), self.symbol);
         Ok(())
     }
 
@@ -36,15 +36,17 @@ impl Strategy for SimpleScalper {
             Some(p) => p,
             None => {
                 self.initial_price = Some(ticker.price);
-                println!("Initial price set to: ${:.2}", ticker.price);
                 return Ok(Signal::Hold);
             }
         };
 
         // Logic: 0.5% drop to Buy, 0.5% rise to Sell
+        // Buy if price drops below 99.5% of base
         if ticker.price < base_price * 0.995 {
             return Ok(Signal::Advice(Side::Buy, ticker.price));
-        } else if ticker.price > base_price * 1.005 {
+        }
+        // Sell if price rises above 100.5% of base
+        else if ticker.price > base_price * 1.005 {
             return Ok(Signal::Advice(Side::Sell, ticker.price));
         }
 
