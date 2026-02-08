@@ -1,6 +1,5 @@
 use crate::connectors::traits::ExchangeClient;
 use crate::strategies::traits::Strategy;
-// ИСПРАВЛЕНИЕ 1: Правильный путь к типам
 use crate::types::{Signal, Ticker};
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -13,7 +12,7 @@ pub struct TradingEngine<E, S> {
 
 impl<E, S> TradingEngine<E, S>
 where
-    E: ExchangeClient,
+    E: ExchangeClient + Send,
     S: Strategy,
 {
     pub fn new(exchange: E, strategy: S, ticker_receiver: mpsc::Receiver<Ticker>) -> Self {
@@ -29,16 +28,19 @@ where
         self.strategy.init().await?;
 
         while let Some(ticker) = self.ticker_receiver.recv().await {
-            // ИСПРАВЛЕНИЕ 2: Заменили .process() на .on_tick()
             let signal = self.strategy.on_tick(&ticker).await?;
 
             match signal {
                 Signal::Advice(side, price) => {
-                    println!("Engine received advice: {:?} at {}", side, price);
-                    // В будущем тут будет вызов: self.exchange.place_order(...)
+                    // Log the signal for Paper Trading simulation
+                    println!(
+                        "🔥 [SIMULATION] SIGNAL: {:?} at ${:.2} for {}",
+                        side, price, ticker.symbol
+                    );
                 }
                 Signal::Hold => {
-                    // Holding...
+                    // Log ticks periodically or keep silent for less noise
+                    // println!("Tick: {} | ${:.2}", ticker.symbol, ticker.price);
                 }
             }
         }

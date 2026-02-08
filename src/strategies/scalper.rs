@@ -1,28 +1,25 @@
 use crate::strategies::traits::Strategy;
-use crate::types::{Position, Side, Signal, Ticker}; // Берем типы напрямую из types.rs
+use crate::types::{Position, Side, Signal, Ticker};
 use anyhow::Result;
+use async_trait::async_trait;
 
 pub struct SimpleScalper {
     symbol: String,
-    target_profit_percent: f64,
-    stop_loss_percent: f64,
-    last_price: f64,
+    initial_price: Option<f64>,
     position: Option<Position>,
 }
 
 impl SimpleScalper {
-    pub fn new(symbol: String, target_profit: f64, stop_loss: f64) -> Self {
+    pub fn new(symbol: String) -> Self {
         Self {
             symbol,
-            target_profit_percent: target_profit,
-            stop_loss_percent: stop_loss,
-            last_price: 0.0,
+            initial_price: None,
             position: None,
         }
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Strategy for SimpleScalper {
     fn name(&self) -> String {
         "SimpleScalper".to_string()
@@ -34,17 +31,21 @@ impl Strategy for SimpleScalper {
     }
 
     async fn on_tick(&mut self, ticker: &Ticker) -> Result<Signal> {
-        self.last_price = ticker.price;
+        // Set initial price on the first tick
+        let base_price = match self.initial_price {
+            Some(p) => p,
+            None => {
+                self.initial_price = Some(ticker.price);
+                println!("Initial price set to: ${:.2}", ticker.price);
+                return Ok(Signal::Hold);
+            }
+        };
 
-        // Простейшая логика (заглушка):
-        // Если нет позиции -> покупаем (Signal::Advice)
-        // Если есть позиция -> держим (Signal::Hold)
-
-        // В реальном коде тут будет математика
-        if self.position.is_none() {
-            // Пример сигнала на покупку
-            // return Ok(Signal::Advice(Side::Buy, ticker.price));
-            return Ok(Signal::Hold);
+        // Logic: 0.5% drop to Buy, 0.5% rise to Sell
+        if ticker.price < base_price * 0.995 {
+            return Ok(Signal::Advice(Side::Buy, ticker.price));
+        } else if ticker.price > base_price * 1.005 {
+            return Ok(Signal::Advice(Side::Sell, ticker.price));
         }
 
         Ok(Signal::Hold)
