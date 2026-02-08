@@ -27,6 +27,7 @@ impl Strategy for SimpleScalper {
     }
 
     async fn init(&mut self) -> Result<()> {
+        println!("Strategy {} initialized for {}", self.name(), self.symbol);
         Ok(())
     }
 
@@ -36,24 +37,38 @@ impl Strategy for SimpleScalper {
             Some(p) => p,
             None => {
                 self.initial_price = Some(ticker.price);
+                println!("Initial price set to: ${:.2}", ticker.price);
                 return Ok(Signal::Hold);
             }
         };
 
-        // Logic: 0.5% drop to Buy, 0.5% rise to Sell
-        // Buy if price drops below 99.5% of base
-        if ticker.price < base_price * 0.995 {
-            return Ok(Signal::Advice(Side::Buy, ticker.price));
-        }
-        // Sell if price rises above 100.5% of base
-        else if ticker.price > base_price * 1.005 {
-            return Ok(Signal::Advice(Side::Sell, ticker.price));
+        // Determine action based on current position state
+        match &self.position {
+            // If we have no position, check for ENTRY (Buy)
+            None => {
+                // Logic: Buy if price drops below 99.5% of base
+                if ticker.price < base_price * 0.995 {
+                    return Ok(Signal::Advice(Side::Buy, ticker.price));
+                }
+            }
+            // If we have a position, check for EXIT (Sell)
+            Some(_pos) => {
+                // Logic: Sell if price rises above 100.5% of base
+                if ticker.price > base_price * 1.005 {
+                    return Ok(Signal::Advice(Side::Sell, ticker.price));
+                }
+            }
         }
 
         Ok(Signal::Hold)
     }
 
-    fn update_position(&mut self, position: &Position) {
-        self.position = Some(position.clone());
+    fn update_position(&mut self, position: Option<Position>) {
+        if position.is_some() {
+            println!("Strategy received confirmation: Position OPENED");
+        } else {
+            println!("Strategy received confirmation: Position CLOSED");
+        }
+        self.position = position;
     }
 }
