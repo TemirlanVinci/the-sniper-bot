@@ -19,40 +19,52 @@ mod utils;
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
 
+    // 1. Load Configuration
     let api_key = env::var("BINANCE_API_KEY").unwrap_or_default();
     let secret_key = env::var("BINANCE_SECRET_KEY").unwrap_or_default();
 
+    // Parse LIVE_TRADING env var (default to false for safety)
+    let live_trading = env::var("LIVE_TRADING")
+        .unwrap_or("false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
+
     let symbol = "BTCUSDT";
 
-    // 1. Initialize Components
-    let mut client = BinanceClient::new(api_key, secret_key);
-    // Note: We skip client.connect() check to start TUI faster,
-    // or you can await it and handle errors before TUI starts.
+    println!("========================================");
+    println!("       THE SNIPER BOT - v0.1.0");
+    println!("========================================");
+    println!("Target: {}", symbol);
+    println!(
+        "Mode:   {}",
+        if live_trading {
+            "🚨 LIVE TRADING"
+        } else {
+            "📝 PAPER TRADING"
+        }
+    );
+    println!("========================================");
 
+    // 2. Initialize Components
+    let mut client = BinanceClient::new(api_key, secret_key);
     let strategy = SimpleScalper::new(symbol.to_string());
 
-    // 2. Create Channels
-    // Channel for Market Data (Binance -> Engine)
+    // 3. Create Channels
     let (ticker_tx, ticker_rx) = mpsc::channel(100);
-    // Channel for UI Events (Engine -> TUI)
-    let (ui_tx, ui_rx) = mpsc::channel(100);
 
-    // 3. Subscribe to Data
-    // We clone the client or ensure StreamClient::subscribe_ticker works with &mut
+    // 4. Subscribe to Data
+    // We clone the client for the engine (execution) vs the subscription (stream)
+    // Note: If BinanceClient doesn't support Clone, we might need to split responsibilities.
+    // Assuming we use the client for subscription here:
     client.subscribe_ticker(symbol, ticker_tx).await?;
 
-    // 4. Spawn Engine Task (Background)
-    let engine_ui_tx = ui_tx.clone();
-    tokio::spawn(async move {
-        let mut engine = TradingEngine::new(client, strategy, ticker_rx, engine_ui_tx);
-        if let Err(e) = engine.run().await {
-            eprintln!("Engine Error: {}", e);
-        }
-    });
+    // 5. Run Engine
+    // Pass the `live_trading` flag to the engine
+    let mut engine = TradingEngine::new(client, strategy, ticker_rx, live_trading);
 
-    // 5. Run TUI (Main Thread)
-    // TUI blocks the main thread until the user presses 'q'
-    tui::run(ui_rx, symbol.to_string()).await?;
+    if let Err(e) = engine.run().await {
+        eprintln!("Fatal Engine Error: {}", e);
+    }
 
     Ok(())
 }
