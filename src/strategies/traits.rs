@@ -1,10 +1,18 @@
-// src/strategies/traits.rs
-use crate::core::types::{Position, Signal, Ticker};
+use crate::types::{Position, Signal, Ticker}; // Исправлен путь: types лежат в корне
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::mpsc; // Добавлено
 
 #[async_trait]
-pub trait StreamClient: Send + Sync {
-    // Pass the sender so the connector knows where to push data
-    async fn subscribe_ticker(&mut self, symbol: &str, sender: mpsc::Sender<Ticker>) -> Result<()>;
+pub trait Strategy: Send + Sync {
+    fn name(&self) -> String;
+
+    // Инициализация стратегии (например, загрузка истории)
+    async fn init(&mut self) -> Result<()>;
+
+    // Обработка нового тика (цена изменилась)
+    async fn on_tick(&mut self, ticker: &Ticker) -> Result<Signal>;
+
+    // Возможность обновить состояние позиций (если биржа подтвердила ордер)
+    fn update_position(&mut self, position: &Position);
 }

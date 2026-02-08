@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
-// ИСПРАВЛЕНИЕ 1: Убрали 'header' из импортов, чтобы не было warning
 use reqwest::{Client, Method};
 use serde::Deserialize;
 use sha2::Sha256;
+use tokio::sync::mpsc; // Добавили этот импорт
 use tokio_tungstenite::connect_async;
 use url::Url;
 
@@ -101,7 +101,6 @@ impl ExchangeClient for BinanceClient {
 
         let price = price_str.parse::<f64>()?;
 
-        // ИСПРАВЛЕНИЕ 2: Добавлено поле timestamp
         Ok(Ticker {
             symbol: symbol.to_string(),
             price,
@@ -222,19 +221,46 @@ impl StreamClient for BinanceClient {
         );
         let url = Url::parse(&ws_url)?;
 
-        tokio::spawn(async move {
-            let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
-            let (_, mut read) = ws_stream.split();
+        println!("Starting WebSocket task for: {}", symbol);
 
-            while let Some(msg) = read.next().await {
-                if let Ok(m) = msg {
-                    if let Ok(text) = m.to_text() {
-                        // ... parsing logic here ...
-                        // sender.send(ticker).await;
+        let symbol = symbol.to_string();
+        tokio::spawn(async move {
+            match connect_async(url).await {
+                Ok((ws_stream, _)) => {
+                    let (_, mut read) = ws_stream.split();
+                    println!("WebSocket connected for {}", symbol);
+
+                    while let Some(message) = read.next().await {
+                        match message {
+                            Ok(msg) => {
+                                if let Ok(text) = msg.to_text() {
+                                    // ПАРСИНГ JSON ОТ БИНАНСА
+                                    // Формат: {"e":"trade", "s":"BTCUSDT", "p":"95000.00", ...}
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                                        if let Some(price_str) = v.get("p").and_then(|p| p.as_str())
+                                        {
+                                            if let Ok(price) = price_str.parse::<f64>() {
+                                                let ticker = Ticker {
+                                                    symbol: symbol.clone(),
+                                                    price,
+                                                    timestamp: Utc::now().timestamp_millis() as u64,
+                                                };
+                                                // Отправляем в канал движку
+                                                let _ = sender.send(ticker).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!("WebSocket Error for {}: {}", symbol, e),
+                        }
                     }
                 }
+                Err(e) => eprintln!("Failed to connect WebSocket for {}: {}", symbol, e),
             }
+            println!("WebSocket task finished for {}", symbol);
         });
+
         Ok(())
     }
 }

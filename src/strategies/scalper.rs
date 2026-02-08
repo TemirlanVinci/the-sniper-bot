@@ -1,69 +1,56 @@
-use crate::strategies::traits::{Signal, Strategy};
-use crate::types::{Inventory, Side, Ticker}; // Assuming Inventory is defined in types
+use crate::strategies::traits::Strategy;
+use crate::types::{Position, Side, Signal, Ticker}; // Берем типы напрямую из types.rs
 use anyhow::Result;
 
 pub struct SimpleScalper {
-    target_drop_pct: f64,
-    target_profit_pct: f64,
-    initial_price: Option<f64>,
+    symbol: String,
+    target_profit_percent: f64,
+    stop_loss_percent: f64,
+    last_price: f64,
+    position: Option<Position>,
 }
 
 impl SimpleScalper {
-    /// Creates a new SimpleScalper strategy.
-    ///
-    /// # Arguments
-    /// * `target_drop_pct` - The percentage drop from initial price to trigger a BUY (e.g., 0.02 for 2%).
-    /// * `target_profit_pct` - The percentage gain from entry price to trigger a SELL (e.g., 0.03 for 3%).
-    pub fn new(target_drop_pct: f64, target_profit_pct: f64) -> Self {
+    pub fn new(symbol: String, target_profit: f64, stop_loss: f64) -> Self {
         Self {
-            target_drop_pct,
-            target_profit_pct,
-            initial_price: None,
+            symbol,
+            target_profit_percent: target_profit,
+            stop_loss_percent: stop_loss,
+            last_price: 0.0,
+            position: None,
         }
     }
 }
 
+#[async_trait::async_trait]
 impl Strategy for SimpleScalper {
-    fn process(&mut self, ticker: &Ticker, inventory: &Inventory) -> Signal {
-        // 1. Initialize Baseline on First Tick
-        if self.initial_price.is_none() {
-            println!("Strategy: Initializing baseline price at {}", ticker.price);
-            self.initial_price = Some(ticker.price);
-            return Signal::None;
+    fn name(&self) -> String {
+        "SimpleScalper".to_string()
+    }
+
+    async fn init(&mut self) -> Result<()> {
+        println!("Strategy {} initialized for {}", self.name(), self.symbol);
+        Ok(())
+    }
+
+    async fn on_tick(&mut self, ticker: &Ticker) -> Result<Signal> {
+        self.last_price = ticker.price;
+
+        // Простейшая логика (заглушка):
+        // Если нет позиции -> покупаем (Signal::Advice)
+        // Если есть позиция -> держим (Signal::Hold)
+
+        // В реальном коде тут будет математика
+        if self.position.is_none() {
+            // Пример сигнала на покупку
+            // return Ok(Signal::Advice(Side::Buy, ticker.price));
+            return Ok(Signal::Hold);
         }
 
-        let initial_price = self.initial_price.unwrap();
+        Ok(Signal::Hold)
+    }
 
-        // 2. Logic: No Position -> Look for Dip (Buy)
-        if inventory.crypto == 0.0 {
-            let buy_target = initial_price * (1.0 - self.target_drop_pct);
-
-            if ticker.price <= buy_target {
-                println!(
-                    "Strategy: Price {} is below target {} (Drop: {}%). Signal: BUY",
-                    ticker.price,
-                    buy_target,
-                    self.target_drop_pct * 100.0
-                );
-                return Signal::Advice(Side::Buy);
-            }
-        }
-        // 3. Logic: Have Position -> Look for Profit (Sell)
-        else {
-            // We rely on inventory to tell us our entry price (average cost basis)
-            let sell_target = inventory.average_cost * (1.0 + self.target_profit_pct);
-
-            if ticker.price >= sell_target {
-                println!(
-                    "Strategy: Price {} met profit target {} (Gain: {}%). Signal: SELL",
-                    ticker.price,
-                    sell_target,
-                    self.target_profit_pct * 100.0
-                );
-                return Signal::Advice(Side::Sell);
-            }
-        }
-
-        Signal::None
+    fn update_position(&mut self, position: &Position) {
+        self.position = Some(position.clone());
     }
 }
