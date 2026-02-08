@@ -215,38 +215,26 @@ impl ExchangeClient for BinanceClient {
 
 #[async_trait]
 impl StreamClient for BinanceClient {
-    async fn subscribe_ticker(&mut self, symbol: &str) -> Result<()> {
+    async fn subscribe_ticker(&mut self, symbol: &str, sender: mpsc::Sender<Ticker>) -> Result<()> {
         let ws_url = format!(
             "wss://stream.binance.com:9443/ws/{}@trade",
             symbol.to_lowercase()
         );
         let url = Url::parse(&ws_url)?;
 
-        println!("Starting WebSocket task for: {}", symbol);
-
-        let symbol = symbol.to_string();
         tokio::spawn(async move {
-            match connect_async(url).await {
-                Ok((ws_stream, _)) => {
-                    let (_, mut read) = ws_stream.split();
-                    println!("WebSocket connected for {}", symbol);
+            let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
+            let (_, mut read) = ws_stream.split();
 
-                    while let Some(message) = read.next().await {
-                        match message {
-                            Ok(msg) => {
-                                if msg.is_text() || msg.is_binary() {
-                                    println!("{} Stream Data: {}", symbol, msg);
-                                }
-                            }
-                            Err(e) => eprintln!("WebSocket Error for {}: {}", symbol, e),
-                        }
+            while let Some(msg) = read.next().await {
+                if let Ok(m) = msg {
+                    if let Ok(text) = m.to_text() {
+                        // ... parsing logic here ...
+                        // sender.send(ticker).await;
                     }
                 }
-                Err(e) => eprintln!("Failed to connect WebSocket for {}: {}", symbol, e),
             }
-            println!("WebSocket task finished for {}", symbol);
         });
-
         Ok(())
     }
 }

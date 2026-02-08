@@ -1,71 +1,113 @@
 mod connectors;
+mod strategies;
 mod types;
+// mod engine; // Assuming you have this module
 
 use crate::connectors::binance::BinanceClient;
-use crate::connectors::traits::{ExchangeClient, StreamClient};
+use crate::strategies::simple_scalper::SimpleScalper;
+use crate::types::Ticker;
+// use crate::engine::TradingEngine; // Import your Engine struct here
+
 use anyhow::{Context, Result};
 use dotenvy::dotenv;
+use futures_util::StreamExt;
+use serde::Deserialize;
 use std::env;
-use tokio::time::{sleep, Duration};
+use tokio::sync::mpsc;
+use tokio_tungstenite::connect_async;
+use url::Url;
+
+// Helper struct to parse raw Binance Trade events
+#[derive(Debug, Deserialize)]
+struct BinanceTradeEvent {
+    s: String, // Symbol
+    p: String, // Price
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Load environment variables
     dotenv().ok();
-
-    // Quick logger setup (optional, but good practice)
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
     tracing_subscriber::fmt::init();
 
-    println!("--- Starting Binance Connector Smoke Test ---");
+    println!("--- Initializing Trading Bot ---");
 
-    // 2. Retrieve Credentials
-    let api_key = env::var("BINANCE_API_KEY").context("BINANCE_API_KEY must be set in .env")?;
-    let secret_key =
-        env::var("BINANCE_SECRET_KEY").context("BINANCE_SECRET_KEY must be set in .env")?;
+    // 1. Configuration
+    let api_key = env::var("BINANCE_API_KEY").context("Missing BINANCE_API_KEY")?;
+    let secret_key = env::var("BINANCE_SECRET_KEY").context("Missing BINANCE_SECRET_KEY")?;
+    let symbol = "BTCUSDT";
 
-    // 3. Instantiate Client
-    let mut client = BinanceClient::new(api_key, secret_key);
+    // 2. Initialize Components
+    let client = BinanceClient::new(api_key, secret_key);
 
-    // 4. Test Connectivity (Ping)
-    println!("\n[1/4] Testing Connectivity...");
-    match client.connect().await {
-        Ok(_) => println!("✅ Connection successful (Ping OK)"),
-        Err(e) => {
-            eprintln!("❌ Connection failed: {}", e);
-            return Err(e);
+    // Scalper: 0.1% drop to buy, 0.2% profit to sell
+    let strategy = SimpleScalper::new(0.001, 0.002);
+
+    // 3. Create Channels
+    // The Engine will receive Tickers from this channel
+    let (tx, rx) = mpsc::channel::<Ticker>(100);
+
+    // 4. Initialize Engine
+    // Assumption: TradingEngine::new(strategy, exchange_client, ticker_receiver)
+    // Note: We wrap the client in a Box or Arc if the Engine requires shared ownership/polymorphism.
+    // For this example, we assume the Engine takes ownership or a reference.
+    // let mut engine = TradingEngine::new(strategy, client, rx);
+
+    println!(">>> Spawning Market Data Stream for {}", symbol);
+
+    // 5. Spawn WebSocket Task (The "Driver")
+    // We do this manually here to pipe data into 'tx'
+    let connect_url = format!(
+        "wss://stream.binance.com:9443/ws/{}@trade",
+        symbol.to_lowercase()
+    );
+    let url = Url::parse(&connect_url)?;
+
+    tokio::spawn(async move {
+        match connect_async(url).await {
+            Ok((ws_stream, _)) => {
+                println!("✅ WebSocket connected.");
+                let (_, mut read) = ws_stream.split();
+
+                while let Some(message) = read.next().await {
+                    match message {
+                        Ok(msg) => {
+                            if let Ok(text) = msg.to_text() {
+                                // Parse the Binance specific JSON
+                                match serde_json::from_str::<BinanceTradeEvent>(text) {
+                                    Ok(event) => {
+                                        // Convert to our generic Ticker
+                                        let ticker = Ticker {
+                                            symbol: event.s,
+                                            price: event.p.parse().unwrap_or(0.0),
+                                        };
+
+                                        // Send to Engine
+                                        if let Err(e) = tx.send(ticker).await {
+                                            eprintln!("❌ Failed to send ticker to Engine: {}", e);
+                                            break; // Stop if receiver is dropped
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Failed to parse trade event: {}", e),
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("WebSocket error: {}", e),
+                    }
+                }
+            }
+            Err(e) => eprintln!("Failed to connect to WebSocket: {}", e),
         }
-    }
+        println!("⚠️ WebSocket task terminated.");
+    });
 
-    // 5. Test Private Endpoint (Balance) - Requires valid Signature
-    println!("\n[2/4] Fetching USDT Balance...");
-    match client.get_balance("USDT").await {
-        Ok(balance) => println!("✅ USDT Balance: {:.2}", balance),
-        Err(e) => eprintln!("❌ Failed to fetch balance: {}", e),
-    }
+    println!(">>> Running Trading Engine...");
 
-    // 6. Test Public Endpoint (Price)
-    println!("\n[3/4] Fetching BTCUSDT Price...");
-    match client.fetch_price("BTCUSDT").await {
-        Ok(ticker) => println!("✅ BTC Price: ${:.2}", ticker.price),
-        Err(e) => eprintln!("❌ Failed to fetch price: {}", e),
-    }
+    // 6. Run the Engine
+    // engine.run().await?;
 
-    // 7. Test WebSocket Stream
-    println!("\n[4/4] Subscribing to BTCUSDT ticker stream...");
-    // This spawns the background task defined in binance.rs
-    if let Err(e) = client.subscribe_ticker("BTCUSDT").await {
-        eprintln!("❌ Failed to subscribe: {}", e);
-    } else {
-        println!("✅ Subscription request sent. Listening for 10 seconds...");
-    }
+    // Placeholder to keep main alive if Engine is not yet implemented:
+    println!("(Engine placeholder: Listening for data...)");
+    tokio::signal::ctrl_c().await?;
 
-    // 8. Keep Alive to observe Stream
-    println!("\n--- Watching Stream (Press Ctrl+C to stop early) ---");
-    sleep(Duration::from_secs(10)).await;
-
-    println!("\n--- Test Complete ---");
     Ok(())
 }
