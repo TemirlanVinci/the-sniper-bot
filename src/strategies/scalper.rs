@@ -32,29 +32,52 @@ impl Strategy for SimpleScalper {
     }
 
     async fn on_tick(&mut self, ticker: &Ticker) -> Result<Signal> {
-        // Set initial price on the first tick
+        // 1. Manage Base Price (Anchor)
+        // If we just finished a trade or started fresh (initial_price is None),
+        // reset anchor to current market price.
         let base_price = match self.initial_price {
             Some(p) => p,
             None => {
                 self.initial_price = Some(ticker.price);
-                println!("Initial price set to: ${:.2}", ticker.price);
+                println!("⚓ Base price anchored at: ${:.2}", ticker.price);
                 return Ok(Signal::Hold);
             }
         };
 
-        // Determine action based on current position state
+        // 2. Define Thresholds
+        // Buy: 0.5% drop from base
+        let buy_threshold = base_price * 0.995;
+        // Take Profit: 0.5% rise from base (approx 1% gain from entry)
+        let take_profit_threshold = base_price * 1.005;
+        // Stop Loss: 1.5% drop from base (approx 1% loss from entry)
+        // CRITICAL: Protects capital if market dumps
+        let stop_loss_threshold = base_price * 0.985;
+
+        // 3. Determine Action
         match &self.position {
-            // If we have no position, check for ENTRY (Buy)
+            // State: LOOKING FOR ENTRY (No Position)
             None => {
-                // Logic: Buy if price drops below 99.5% of base
-                if ticker.price < base_price * 0.995 {
+                if ticker.price < buy_threshold {
+                    println!(
+                        "📉 Dip detected (${:.2} < ${:.2}) -> BUY SIGNAL",
+                        ticker.price, buy_threshold
+                    );
                     return Ok(Signal::Advice(Side::Buy, ticker.price));
                 }
             }
-            // If we have a position, check for EXIT (Sell)
+            // State: LOOKING FOR EXIT (Has Position)
             Some(_pos) => {
-                // Logic: Sell if price rises above 100.5% of base
-                if ticker.price > base_price * 1.005 {
+                if ticker.price > take_profit_threshold {
+                    println!(
+                        "📈 Target hit (${:.2} > ${:.2}) -> TAKE PROFIT",
+                        ticker.price, take_profit_threshold
+                    );
+                    return Ok(Signal::Advice(Side::Sell, ticker.price));
+                } else if ticker.price < stop_loss_threshold {
+                    println!(
+                        "🛑 Stop Loss hit (${:.2} < ${:.2}) -> STOP LOSS",
+                        ticker.price, stop_loss_threshold
+                    );
                     return Ok(Signal::Advice(Side::Sell, ticker.price));
                 }
             }
@@ -64,10 +87,14 @@ impl Strategy for SimpleScalper {
     }
 
     fn update_position(&mut self, position: Option<Position>) {
-        if position.is_some() {
-            println!("Strategy received confirmation: Position OPENED");
+        if let Some(ref pos) = position {
+            println!("✅ Position OPENED at ${:.2}", pos.entry_price);
         } else {
-            println!("Strategy received confirmation: Position CLOSED");
+            println!("❎ Position CLOSED. Resetting cycle...");
+            // CRITICAL LOGIC FIX:
+            // Reset initial_price to None. This forces on_tick to
+            // grab the NEW current price as the base for the next trade cycle.
+            self.initial_price = None;
         }
         self.position = position;
     }
