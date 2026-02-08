@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
-use reqwest::{header, Client, Method};
+// ИСПРАВЛЕНИЕ 1: Убрали 'header' из импортов, чтобы не было warning
+use reqwest::{Client, Method};
 use serde::Deserialize;
 use sha2::Sha256;
 use tokio_tungstenite::connect_async;
@@ -30,28 +31,22 @@ impl BinanceClient {
         }
     }
 
-    /// Generates the HMAC-SHA256 signature and returns the full query string
     fn sign_and_build_query(&self, params: Vec<(&str, String)>) -> Result<String> {
-        // 1. Append timestamp (essential for security/replay protection)
         let mut params = params;
         let timestamp = Utc::now().timestamp_millis().to_string();
         params.push(("timestamp", timestamp));
 
-        // 2. Create the query string (e.g., "symbol=BTCUSDT&timestamp=1600000000")
         let query_string = serde_urlencoded::to_string(&params)?;
 
-        // 3. Create HMAC signature
         let mut mac = HmacSha256::new_from_slice(self.secret_key.as_bytes())
             .context("Invalid secret key length")?;
         mac.update(query_string.as_bytes());
         let result = mac.finalize();
         let signature = hex::encode(result.into_bytes());
 
-        // 4. Return full query with signature appended
         Ok(format!("{}&signature={}", query_string, signature))
     }
 
-    /// Helper for authenticated requests
     async fn send_signed_request<T: for<'de> Deserialize<'de>>(
         &self,
         method: Method,
@@ -77,7 +72,6 @@ impl BinanceClient {
 #[async_trait]
 impl ExchangeClient for BinanceClient {
     async fn connect(&mut self) -> Result<()> {
-        // Simple connectivity check to Binance API
         let url = format!("{}/api/v3/ping", self.base_rest_url);
         self.http_client
             .get(&url)
@@ -88,7 +82,6 @@ impl ExchangeClient for BinanceClient {
     }
 
     async fn fetch_price(&self, symbol: &str) -> Result<Ticker> {
-        // Public endpoint, no signature needed
         let url = format!(
             "{}/api/v3/ticker/price?symbol={}",
             self.base_rest_url, symbol
@@ -108,9 +101,11 @@ impl ExchangeClient for BinanceClient {
 
         let price = price_str.parse::<f64>()?;
 
+        // ИСПРАВЛЕНИЕ 2: Добавлено поле timestamp
         Ok(Ticker {
             symbol: symbol.to_string(),
             price,
+            timestamp: Utc::now().timestamp_millis() as u64,
         })
     }
 
@@ -126,9 +121,8 @@ impl ExchangeClient for BinanceClient {
             Side::Sell => "SELL",
         };
 
-        // Determine order type based on price presence
         let (type_str, time_in_force) = match price {
-            Some(_) => ("LIMIT", Some("GTC")), // Good Till Cancelled
+            Some(_) => ("LIMIT", Some("GTC")),
             None => ("MARKET", None),
         };
 
@@ -146,7 +140,6 @@ impl ExchangeClient for BinanceClient {
             params.push(("timeInForce", tif.to_string()));
         }
 
-        // Use a temporary struct for deserialization to map Binance response to our generic OrderResponse
         #[derive(Deserialize)]
         struct BinanceOrderResponse {
             #[serde(rename = "orderId")]
@@ -181,7 +174,6 @@ impl ExchangeClient for BinanceClient {
             .send_signed_request(Method::GET, "/api/v3/account", vec![])
             .await?;
 
-        // Find the specific asset in the balances list
         let balance = resp
             .balances
             .iter()
@@ -233,7 +225,6 @@ impl StreamClient for BinanceClient {
         println!("Starting WebSocket task for: {}", symbol);
 
         let symbol = symbol.to_string();
-        // Spawn a detached background task
         tokio::spawn(async move {
             match connect_async(url).await {
                 Ok((ws_stream, _)) => {
@@ -244,8 +235,6 @@ impl StreamClient for BinanceClient {
                         match message {
                             Ok(msg) => {
                                 if msg.is_text() || msg.is_binary() {
-                                    // In a real app, you'd deserialize and send to a channel.
-                                    // For this task: simply print to stdout.
                                     println!("{} Stream Data: {}", symbol, msg);
                                 }
                             }

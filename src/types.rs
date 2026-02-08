@@ -44,3 +44,10 @@ pub struct Inventory {
     pub quote_balance: f64,                   // e.g., USDT available
     pub positions: HashMap<String, Position>, // Currently held assets
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderResponse {
+    pub id: String,
+    pub symbol: String,
+    pub status: String,
+}
