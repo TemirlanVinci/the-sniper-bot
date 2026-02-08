@@ -1,12 +1,12 @@
 // src/tui/mod.rs
-use crate::types::{Signal, Ticker, UiEvent};
+use crate::types::{Signal, UiEvent}; // Removed Ticker
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend, // Removed Backend
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -56,7 +56,6 @@ impl App {
 }
 
 pub async fn run(mut rx: mpsc::Receiver<UiEvent>, symbol: String) -> anyhow::Result<()> {
-    // Setup Terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -68,7 +67,6 @@ pub async fn run(mut rx: mpsc::Receiver<UiEvent>, symbol: String) -> anyhow::Res
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
-        // Poll for Input (Non-blocking check)
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if let KeyCode::Char('q') = key.code {
@@ -77,13 +75,11 @@ pub async fn run(mut rx: mpsc::Receiver<UiEvent>, symbol: String) -> anyhow::Res
             }
         }
 
-        // Poll for UI Events from Engine
         while let Ok(event) = rx.try_recv() {
             app.on_event(event);
         }
     }
 
-    // Restore Terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -101,15 +97,14 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         .margin(1)
         .constraints(
             [
-                Constraint::Length(3),  // Header
-                Constraint::Min(10),    // Main Content
-                Constraint::Length(10), // Logs
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(10),
             ]
             .as_ref(),
         )
         .split(f.size());
 
-    // 1. Header (Price)
     let price_text = match app.current_price {
         Some(p) => format!("${:.2}", p),
         None => "Waiting for data...".to_string(),
@@ -131,7 +126,6 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).title("Status"));
     f.render_widget(header, chunks[0]);
 
-    // 2. Signals List
     let signals: Vec<ListItem> = app
         .signals
         .iter()
@@ -151,7 +145,6 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     );
     f.render_widget(signals_list, chunks[1]);
 
-    // 3. Logs
     let logs: Vec<ListItem> = app
         .logs
         .iter()

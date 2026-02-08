@@ -1,6 +1,6 @@
 // src/main.rs
 use crate::connectors::binance::BinanceClient;
-use crate::connectors::traits::{ExchangeClient, StreamClient};
+use crate::connectors::traits::StreamClient; // Removed unused ExchangeClient
 use crate::core::engine::TradingEngine;
 use crate::strategies::scalper::SimpleScalper;
 use dotenvy::dotenv;
@@ -19,11 +19,10 @@ mod utils;
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
 
-    // 1. Load Configuration
     let api_key = env::var("BINANCE_API_KEY").unwrap_or_default();
     let secret_key = env::var("BINANCE_SECRET_KEY").unwrap_or_default();
 
-    // Parse LIVE_TRADING env var (default to false for safety)
+    // Parse LIVE_TRADING env var
     let live_trading = env::var("LIVE_TRADING")
         .unwrap_or("false".to_string())
         .parse::<bool>()
@@ -31,40 +30,33 @@ async fn main() -> anyhow::Result<()> {
 
     let symbol = "BTCUSDT";
 
-    println!("========================================");
-    println!("       THE SNIPER BOT - v0.1.0");
-    println!("========================================");
-    println!("Target: {}", symbol);
-    println!(
-        "Mode:   {}",
-        if live_trading {
-            "🚨 LIVE TRADING"
-        } else {
-            "📝 PAPER TRADING"
-        }
-    );
-    println!("========================================");
-
-    // 2. Initialize Components
+    // 1. Initialize Components
     let mut client = BinanceClient::new(api_key, secret_key);
     let strategy = SimpleScalper::new(symbol.to_string());
 
-    // 3. Create Channels
+    // 2. Create Channels
     let (ticker_tx, ticker_rx) = mpsc::channel(100);
+    let (ui_tx, ui_rx) = mpsc::channel(100);
 
-    // 4. Subscribe to Data
-    // We clone the client for the engine (execution) vs the subscription (stream)
-    // Note: If BinanceClient doesn't support Clone, we might need to split responsibilities.
-    // Assuming we use the client for subscription here:
+    // 3. Subscribe to Data
     client.subscribe_ticker(symbol, ticker_tx).await?;
 
-    // 5. Run Engine
-    // Pass the `live_trading` flag to the engine
-    let mut engine = TradingEngine::new(client, strategy, ticker_rx, live_trading);
+    // 4. Spawn Engine Task (Background)
+    // We clone ui_tx so we can pass it to the engine
+    let engine_ui_tx = ui_tx.clone();
 
-    if let Err(e) = engine.run().await {
-        eprintln!("Fatal Engine Error: {}", e);
-    }
+    tokio::spawn(async move {
+        // FIX: Pass all required arguments: exchange, strategy, rx, ui_sender, live_mode
+        let mut engine =
+            TradingEngine::new(client, strategy, ticker_rx, engine_ui_tx, live_trading);
+
+        if let Err(e) = engine.run().await {
+            eprintln!("Engine Error: {}", e);
+        }
+    });
+
+    // 5. Run TUI (Main Thread)
+    tui::run(ui_rx, symbol.to_string()).await?;
 
     Ok(())
 }
