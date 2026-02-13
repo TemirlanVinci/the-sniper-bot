@@ -2,7 +2,7 @@
 use crate::connectors::binance::BinanceClient;
 use crate::connectors::traits::StreamClient; // Removed unused ExchangeClient
 use crate::core::engine::TradingEngine;
-use crate::strategies::scalper::SimpleScalper;
+use crate::strategies::scalper::RsiBollingerStrategy;
 use dotenvy::dotenv;
 use std::env;
 use tokio::sync::mpsc;
@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 1. Initialize Components
     let mut client = BinanceClient::new(api_key, secret_key);
-    let strategy = SimpleScalper::new(symbol.to_string());
+    let strategy = RsiBollingerStrategy::new(symbol.to_string());
 
     // 2. Create Channels
     let (ticker_tx, ticker_rx) = mpsc::channel(100);

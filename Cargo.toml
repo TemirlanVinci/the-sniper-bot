@@ -8,7 +8,8 @@ authors = ["TemirlanVinci"]
 # Async Runtime
 tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"
-async-trait = "0.1"                               # Essential for Traits in Hexagonal Arch
+async-trait = "0.1"
+ta = "0.5.0"                                      # Essential for Traits in Hexagonal Arch
 
 # Networking & HTTP
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
