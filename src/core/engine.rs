@@ -3,13 +3,12 @@ use crate::connectors::traits::ExecutionHandler;
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker, UiEvent};
 use anyhow::Result;
-use rust_decimal::prelude::FromPrimitive; // <--- ADDED THIS
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::str::FromStr;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct EngineState {
@@ -49,8 +48,9 @@ where
         }
     }
 
-    fn load_state(&mut self) {
-        if let Ok(data) = fs::read_to_string(&self.state_file) {
+    /// Async load state using tokio::fs to avoid blocking the reactor
+    async fn load_state(&mut self) {
+        if let Ok(data) = tokio::fs::read_to_string(&self.state_file).await {
             if let Ok(state) = serde_json::from_str::<EngineState>(&data) {
                 info!("Restored state: {:?}", state);
                 self.strategy.update_position(state.active_position);
@@ -58,27 +58,44 @@ where
         }
     }
 
-    fn save_state(&self, position: Option<Position>) {
+    /// Async save state using tokio::fs to avoid blocking the reactor
+    async fn save_state(&self, position: Option<Position>) {
         let state = EngineState {
             active_position: position,
         };
         if let Ok(data) = serde_json::to_string_pretty(&state) {
-            let _ = fs::write(&self.state_file, data);
+            // Non-blocking write
+            if let Err(e) = tokio::fs::write(&self.state_file, data).await {
+                error!("Failed to save bot state: {}", e);
+            }
+        }
+    }
+
+    /// Helper to send UI updates without blocking
+    fn send_ui_event(&self, event: UiEvent) {
+        match self.ui_sender.try_send(event) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // DROP the message. Do NOT wait.
+                // Optional: warn!("UI Channel full, dropping frame");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Critical: Receiver closed. Log error but keep engine running.
+                error!("UI Channel closed! Interface is likely dead.");
+            }
         }
     }
 
     pub async fn run(&mut self) -> Result<()> {
         info!("Engine starting...");
-        self.load_state();
+        self.load_state().await;
         self.strategy.init().await?;
 
         info!("Engine loop running. Live Mode: {}", self.live_mode);
 
         while let Some(ticker) = self.ticker_receiver.recv().await {
-            let _ = self
-                .ui_sender
-                .send(UiEvent::TickerUpdate(ticker.clone()))
-                .await;
+            // 1. Non-Blocking UI Update (Ticker)
+            self.send_ui_event(UiEvent::TickerUpdate(ticker.clone()));
 
             let signal = self.strategy.on_tick(&ticker).await?;
 
@@ -98,11 +115,11 @@ where
         current_price: Decimal,
         ticker: &Ticker,
     ) -> Result<()> {
+        // Critical Log: Always log signal regardless of UI state
         info!("Signal detected: {:?} @ {}", side, current_price);
-        let _ = self
-            .ui_sender
-            .send(UiEvent::Signal(Signal::Advice(side, current_price)))
-            .await;
+
+        // 2. Non-Blocking UI Update (Signal)
+        self.send_ui_event(UiEvent::Signal(Signal::Advice(side, current_price)));
 
         if !self.live_mode {
             // Simulation logic
@@ -117,7 +134,7 @@ where
                 Side::Sell => None,
             };
             self.strategy.update_position(fake_pos.clone());
-            self.save_state(fake_pos);
+            self.save_state(fake_pos).await;
             return Ok(());
         }
 
@@ -145,16 +162,11 @@ where
             Side::Sell => "BTC", // TODO: Should be base asset from config (parse from symbol)
         };
 
-        let balance = self
+        let _balance = self
             .execution_handler
             .get_balance(required_asset)
             .await
             .unwrap_or(Decimal::ZERO);
-
-        let required_amt = match side {
-            Side::Buy => quantity * current_price,
-            Side::Sell => quantity,
-        };
 
         // Optional: Add balance check logic here if strictly required
         // if balance < required_amt { ... }
@@ -185,16 +197,16 @@ where
                             highest_price: final_price,
                         };
                         self.strategy.update_position(Some(pos.clone()));
-                        self.save_state(Some(pos));
+                        self.save_state(Some(pos)).await;
                     }
                     Side::Sell => {
                         self.strategy.update_position(None);
-                        self.save_state(None);
+                        self.save_state(None).await;
                     }
                 }
             }
             Err(e) => {
-                warn!("⚠️ Execution Error (Slippage/IOC/Balance): {}", e);
+                error!("⚠️ Execution Error (Slippage/IOC/Balance): {}", e);
             }
         }
 
