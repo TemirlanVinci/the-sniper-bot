@@ -6,9 +6,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
-use ta::indicators::{BollingerBands, RelativeStrengthIndex};
+use ta::indicators::{AverageTrueRange, BollingerBands, RelativeStrengthIndex};
 use ta::{DataItem, Next};
-use tracing::{debug, info};
+use tracing::{debug, info}; // Убрал warn
 
 #[derive(Debug, Clone)]
 struct CandleBuilder {
@@ -46,9 +46,15 @@ pub struct RsiBollingerStrategy {
     symbol: String,
     rsi: RelativeStrengthIndex,
     bb: BollingerBands,
+    atr: AverageTrueRange,
+
     current_candle: Option<CandleBuilder>,
+
+    // Состояние индикаторов
     last_rsi_value: f64,
+    last_atr_value: f64, // <--- Добавили поле для хранения ATR
     last_bb_values: Option<(f64, f64, f64)>,
+
     position: Option<Position>,
 
     // Warm-up Logic
@@ -57,6 +63,7 @@ pub struct RsiBollingerStrategy {
 
     // Strategy Parameters
     obi_threshold: Decimal,
+    min_volatility: f64,
     trailing_callback: Decimal,
 }
 
@@ -66,17 +73,19 @@ impl RsiBollingerStrategy {
             symbol,
             rsi: RelativeStrengthIndex::new(config.rsi_period).unwrap(),
             bb: BollingerBands::new(config.bb_period, config.bb_std_dev).unwrap(),
+            atr: AverageTrueRange::new(14).unwrap(),
 
             current_candle: None,
             last_rsi_value: 50.0,
+            last_atr_value: 0.0, // <--- Инициализация
             last_bb_values: None,
             position: None,
 
-            // Warm-up initialization
             warmup_period: 50,
             processed_candles: 0,
 
             obi_threshold: Decimal::from_f64(config.obi_threshold).unwrap_or(Decimal::ZERO),
+            min_volatility: config.min_volatility.to_f64().unwrap_or(0.003),
             trailing_callback: Decimal::from_str("0.002").unwrap(),
         }
     }
@@ -87,11 +96,13 @@ impl RsiBollingerStrategy {
             .low(candle.low.to_f64().unwrap_or_default())
             .close(candle.close.to_f64().unwrap_or_default())
             .open(candle.open.to_f64().unwrap_or_default())
-            .volume(0.0)
+            .volume(0.0) // Объем для ATR не критичен, но можно добавить если есть в тикере
             .build()
             .unwrap();
 
         self.last_rsi_value = self.rsi.next(&item);
+        self.last_atr_value = self.atr.next(&item); // <--- Сохраняем значение здесь!
+
         let bb_out = self.bb.next(&item);
         self.last_bb_values = Some((bb_out.lower, bb_out.average, bb_out.upper));
 
@@ -107,15 +118,16 @@ impl Strategy for RsiBollingerStrategy {
 
     async fn init(&mut self) -> Result<()> {
         info!(
-            "🚀 Strategy {} initialized. Warm-up target: {} candles.",
+            "🚀 Strategy {} initialized. Warm-up target: {} candles. Min Volatility: {:.2}%",
             self.name(),
-            self.warmup_period
+            self.warmup_period,
+            self.min_volatility * 100.0
         );
         Ok(())
     }
 
     async fn on_tick(&mut self, tick: &Ticker) -> Result<Signal> {
-        // 1. Candle Logic (Updates Indicators)
+        // 1. Candle Logic
         let tick_minute_start = (tick.timestamp / 60_000) * 60_000;
         match self.current_candle.clone() {
             Some(mut candle) => {
@@ -134,10 +146,13 @@ impl Strategy for RsiBollingerStrategy {
 
         // 2. Warm-up Check
         if self.processed_candles < self.warmup_period {
-            debug!(
-                "Warming up: {} / {} candles processed",
-                self.processed_candles, self.warmup_period
-            );
+            // Логируем реже, чтобы не засорять
+            if self.processed_candles % 10 == 0 {
+                debug!(
+                    "Warming up: {} / {} candles",
+                    self.processed_candles, self.warmup_period
+                );
+            }
             return Ok(Signal::Hold);
         }
 
@@ -159,22 +174,37 @@ impl Strategy for RsiBollingerStrategy {
         // 5. Entry/Exit Logic
         match &mut self.position {
             None => {
+                // --- VOLATILITY FILTER ---
+                let current_atr = self.last_atr_value; // <--- Берем сохраненное значение
+                let current_price = tick.price.to_f64().unwrap_or(1.0);
+
+                // ATR в процентах от цены
+                let vol_pct = current_atr / current_price;
+
+                if vol_pct < self.min_volatility {
+                    // Рынок "спит", пропускаем
+                    return Ok(Signal::Hold);
+                }
+
                 // ENTRY LOGIC
                 if tick.price < bb_lower && self.last_rsi_value < 30.0 && obi > self.obi_threshold {
                     info!(
-                        "⚡ LONG SIGNAL: RSI {:.2} < 30 & OBI {:.2} > {}",
-                        self.last_rsi_value, obi, self.obi_threshold
+                        "⚡ LONG SIGNAL: RSI {:.2} < 30 & OBI {:.2} > {}. Volatility: {:.4}%",
+                        self.last_rsi_value,
+                        obi,
+                        self.obi_threshold,
+                        vol_pct * 100.0
                     );
                     return Ok(Signal::Advice(Side::Buy, tick.price));
                 }
             }
             Some(pos) => {
-                let mut state_changed = false; // <--- Флаг изменений
+                let mut state_changed = false;
 
                 // TRAILING STOP LOGIC
                 if tick.price > pos.highest_price {
                     pos.highest_price = tick.price;
-                    state_changed = true; // <--- Фиксируем обновление максимума
+                    state_changed = true;
                 }
 
                 let trailing_stop_price =
@@ -194,7 +224,6 @@ impl Strategy for RsiBollingerStrategy {
                     return Ok(Signal::Advice(Side::Sell, tick.price));
                 }
 
-                // <--- Если не вышли из сделки, но обновили хай — просим сохранить
                 if state_changed {
                     return Ok(Signal::StateChanged);
                 }
@@ -208,7 +237,6 @@ impl Strategy for RsiBollingerStrategy {
         self.position = position;
     }
 
-    // <--- Реализация геттера
     fn get_position(&self) -> Option<Position> {
         self.position.clone()
     }
