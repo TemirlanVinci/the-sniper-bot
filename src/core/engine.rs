@@ -3,11 +3,9 @@ use crate::config::AppConfig;
 use crate::connectors::traits::ExecutionHandler;
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker, UiEvent};
-// --- ДОБАВЛЕН ИМПОРТ ---
-use crate::utils::precision::{normalize_price, normalize_quantity};
-// -----------------------
+use crate::utils::precision::{normalize_price, normalize_quantity}; // Импорт утилит
 use anyhow::Result;
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive}; // Добавлен ToPrimitive для логирования если нужно
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -52,7 +50,6 @@ where
         }
     }
 
-    /// Async load state using tokio::fs to avoid blocking the reactor
     async fn load_state(&mut self) {
         if let Ok(data) = tokio::fs::read_to_string(&self.state_file).await {
             if let Ok(state) = serde_json::from_str::<EngineState>(&data) {
@@ -62,26 +59,21 @@ where
         }
     }
 
-    /// Async save state using tokio::fs to avoid blocking the reactor
     async fn save_state(&self, position: Option<Position>) {
         let state = EngineState {
             active_position: position,
         };
         if let Ok(data) = serde_json::to_string_pretty(&state) {
-            // Non-blocking write
             if let Err(e) = tokio::fs::write(&self.state_file, data).await {
                 error!("Failed to save bot state: {}", e);
             }
         }
     }
 
-    /// Helper to send UI updates without blocking
     fn send_ui_event(&self, event: UiEvent) {
         match self.ui_sender.try_send(event) {
             Ok(_) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // DROP the message. Do NOT wait.
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 error!("UI Channel closed! Interface is likely dead.");
             }
@@ -96,7 +88,6 @@ where
         info!("Engine loop running. Live Mode: {}", self.live_mode);
 
         while let Some(ticker) = self.ticker_receiver.recv().await {
-            // 1. Non-Blocking UI Update (Ticker)
             self.send_ui_event(UiEvent::TickerUpdate(ticker.clone()));
 
             let signal = self.strategy.on_tick(&ticker).await?;
@@ -125,77 +116,87 @@ where
         info!("Signal detected: {:?} @ {}", side, current_price);
         self.send_ui_event(UiEvent::Signal(Signal::Advice(side, current_price)));
 
+        // 1. Расчет "сырого" объема
+        let order_usdt =
+            Decimal::from_f64(self.config.order_size_usdt).unwrap_or(Decimal::from(10));
+        let raw_qty = order_usdt / current_price;
+
+        // 2. Нормализация объема (используем шаг из конфига)
+        let step_size = self.config.symbol_step_size;
+        let quantity = normalize_quantity(raw_qty, step_size);
+
+        // 3. Проверка Min Notional (>$5.5)
+        let notional_value = quantity * current_price;
+        let min_notional = Decimal::from_str("5.5").unwrap(); // Безопасный парсинг без макроса dec!
+
+        if notional_value < min_notional {
+            warn!(
+                "Order skipped: Notional value ${:.2} < ${} (Min limit). Raw Qty: {}, Norm Qty: {}",
+                notional_value, min_notional, raw_qty, quantity
+            );
+            return Ok(());
+        }
+
+        if quantity.is_zero() {
+            warn!("⚠️ Quantity is zero after normalization. Not entering position.");
+            return Ok(());
+        }
+
+        // 4. Подготовка цены (для лимитных ордеров или симуляции)
+        // Для простоты берем tick_size из конфига
+        let tick_size = self.config.symbol_tick_size;
+
+        // В Paper Mode мы "исполняем" по текущей цене (или с проскальзыванием), но нормализуем её
+        // В Live Mode ExecutionHandler сам может добавить slippage, но нам нужна базовая цена
+        let target_price = normalize_price(current_price, tick_size);
+
         if !self.live_mode {
-            // Simulation logic
-            // Dynamic quantity calculation: USDT / price
-            let order_usdt =
-                Decimal::from_f64(self.config.order_size_usdt).unwrap_or(Decimal::from(10));
-
-            // --- НОВАЯ ЛОГИКА НОРМАЛИЗАЦИИ (Paper Mode) ---
-            // Хардкод для симуляции (как указано в задаче для BTC)
-            let step_size = Decimal::from_str("0.001").unwrap(); // Шаг лота
-            let tick_size = Decimal::from_str("0.1").unwrap(); // Шаг цены
-
-            let raw_qty = order_usdt / current_price;
-            let quantity = normalize_quantity(raw_qty, step_size);
-            let limit_price = normalize_price(current_price, tick_size);
-
+            // --- PAPER MODE ---
             let fake_pos = match side {
                 Side::Buy => {
                     info!(
-                        "Paper Buy: {} coins (Raw: {}) at ${} (Normalized from {})",
-                        quantity, raw_qty, limit_price, current_price
+                        "Paper Buy: {} coins at ${} (Notional: ${:.2})",
+                        quantity, target_price, notional_value
                     );
-
-                    if quantity.is_zero() {
-                        warn!("⚠️ Quantity is zero after normalization. Not entering position.");
-                        return Ok(());
-                    }
 
                     Some(Position {
                         symbol: ticker.symbol.clone(),
                         quantity,
-                        entry_price: limit_price,
+                        entry_price: target_price,
                         unrealized_pnl: Decimal::ZERO,
-                        highest_price: limit_price,
+                        highest_price: target_price,
                     })
                 }
                 Side::Sell => {
-                    info!(
-                        "Paper Sell: Closing position at ${} (Normalized)",
-                        limit_price
-                    );
+                    info!("Paper Sell: Closing position at ${}", target_price);
                     None
                 }
             };
             self.strategy.update_position(fake_pos.clone());
             self.save_state(fake_pos).await;
             return Ok(());
-            // ---------------------------------------------
         }
 
-        // --- LIVE EXECUTION LOGIC ---
-        let order_usdt =
-            Decimal::from_f64(self.config.order_size_usdt).unwrap_or(Decimal::from(10));
-        let raw_qty = order_usdt / current_price;
-        let quantity = self.execution_handler.normalize_quantity(raw_qty);
+        // --- LIVE MODE ---
+        // Для Live режима мы передаем нормализованное количество.
+        // Цену execution_handler может пересчитать (slippage), но мы передадим ему "чистую"
+        // или позволим ему самому решать. В текущей реализации handler принимает option price.
+
+        // Добавим проскальзывание для лимитного ордера, чтобы он сработал как маркет (taker)
+        // или оставим current_price если это Market Order (в зависимости от реализации handler).
+        // Предположим, мы шлем Limit ордер с агрессивной ценой.
+
+        let slippage_pct = Decimal::from_str("0.001").unwrap(); // 0.1%
+        let execution_price_raw = match side {
+            Side::Buy => current_price * (Decimal::ONE + slippage_pct),
+            Side::Sell => current_price * (Decimal::ONE - slippage_pct),
+        };
+        let final_price = normalize_price(execution_price_raw, tick_size);
 
         info!(
-            "Calculated Quantity: {} (Raw: {}) based on {} USDT",
-            quantity, raw_qty, order_usdt
+            "Executing LIVE {:?}: Qty: {} @ Price: {} (Notional: ${:.2})",
+            side, quantity, final_price, notional_value
         );
-
-        if quantity.is_zero() {
-            warn!("⚠️ Quantity is zero. Aborting.");
-            return Ok(());
-        }
-
-        let slippage = Decimal::from_str("0.001").unwrap();
-        let target_price = match side {
-            Side::Buy => current_price * (Decimal::ONE + slippage),
-            Side::Sell => current_price * (Decimal::ONE - slippage),
-        };
-        let final_price = self.execution_handler.normalize_price(target_price);
 
         match self
             .execution_handler
@@ -209,7 +210,7 @@ where
                         let pos = Position {
                             symbol: ticker.symbol.clone(),
                             quantity,
-                            entry_price: final_price,
+                            entry_price: final_price, // В идеале брать из ответа биржи (avg_price)
                             unrealized_pnl: Decimal::ZERO,
                             highest_price: final_price,
                         };

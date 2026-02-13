@@ -1,5 +1,6 @@
 use config::{Config, ConfigError, File};
-use serde::Deserialize;
+use rust_decimal::Decimal;
+use serde::Deserialize; // Импортируем Decimal
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct StrategyConfig {
@@ -15,7 +16,9 @@ pub struct AppConfig {
     pub secret_key: String,
     pub symbol: String,
     pub leverage: u8,
-    pub order_size_usdt: f64, // Renamed from order_qty_usdt
+    pub order_size_usdt: f64,
+    pub symbol_step_size: Decimal, // Шаг объема (лотность), например 0.001
+    pub symbol_tick_size: Decimal, // Шаг цены, например 0.1
     pub strategy: StrategyConfig,
 }
 

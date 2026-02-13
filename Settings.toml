@@ -12,3 +12,6 @@ rsi_period = 14
 obi_threshold = 0.15
 bb_period = 20
 bb_std_dev = 2.0
+
+symbol_step_size = "0.001"  # Для BTC. Если торгуешь ETH ставь 0.01, если XRP - 1.0
+symbol_tick_size = "0.1"    # Для BTC.
