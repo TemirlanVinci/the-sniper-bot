@@ -52,7 +52,7 @@ pub struct RsiBollingerStrategy {
 
     // Состояние индикаторов
     last_rsi_value: f64,
-    last_atr_value: f64, // <--- Добавили поле для хранения ATR
+    last_atr_value: f64, // <--- Значение ATR
     last_bb_values: Option<(f64, f64, f64)>,
 
     position: Option<Position>,
@@ -64,7 +64,8 @@ pub struct RsiBollingerStrategy {
     // Strategy Parameters
     obi_threshold: Decimal,
     min_volatility: f64,
-    trailing_callback: Decimal,
+    // Заменили trailing_callback на atr_multiplier
+    atr_multiplier: Decimal,
 }
 
 impl RsiBollingerStrategy {
@@ -77,7 +78,7 @@ impl RsiBollingerStrategy {
 
             current_candle: None,
             last_rsi_value: 50.0,
-            last_atr_value: 0.0, // <--- Инициализация
+            last_atr_value: 0.0,
             last_bb_values: None,
             position: None,
 
@@ -86,7 +87,8 @@ impl RsiBollingerStrategy {
 
             obi_threshold: Decimal::from_f64(config.obi_threshold).unwrap_or(Decimal::ZERO),
             min_volatility: config.min_volatility.to_f64().unwrap_or(0.003),
-            trailing_callback: Decimal::from_str("0.002").unwrap(),
+            // Инициализация множителя из конфига (default 2.0 если придет 0)
+            atr_multiplier: Decimal::from_f64(config.atr_multiplier).unwrap_or(Decimal::from(2)),
         }
     }
 
@@ -96,12 +98,12 @@ impl RsiBollingerStrategy {
             .low(candle.low.to_f64().unwrap_or_default())
             .close(candle.close.to_f64().unwrap_or_default())
             .open(candle.open.to_f64().unwrap_or_default())
-            .volume(0.0) // Объем для ATR не критичен, но можно добавить если есть в тикере
+            .volume(0.0)
             .build()
             .unwrap();
 
         self.last_rsi_value = self.rsi.next(&item);
-        self.last_atr_value = self.atr.next(&item); // <--- Сохраняем значение здесь!
+        self.last_atr_value = self.atr.next(&item); // Сохраняем актуальный ATR
 
         let bb_out = self.bb.next(&item);
         self.last_bb_values = Some((bb_out.lower, bb_out.average, bb_out.upper));
@@ -118,10 +120,10 @@ impl Strategy for RsiBollingerStrategy {
 
     async fn init(&mut self) -> Result<()> {
         info!(
-            "🚀 Strategy {} initialized. Warm-up target: {} candles. Min Volatility: {:.2}%",
+            "🚀 Strategy {} initialized. Warm-up target: {} candles. ATR Multiplier: {}",
             self.name(),
             self.warmup_period,
-            self.min_volatility * 100.0
+            self.atr_multiplier
         );
         Ok(())
     }
@@ -146,7 +148,6 @@ impl Strategy for RsiBollingerStrategy {
 
         // 2. Warm-up Check
         if self.processed_candles < self.warmup_period {
-            // Логируем реже, чтобы не засорять
             if self.processed_candles % 10 == 0 {
                 debug!(
                     "Warming up: {} / {} candles",
@@ -175,14 +176,11 @@ impl Strategy for RsiBollingerStrategy {
         match &mut self.position {
             None => {
                 // --- VOLATILITY FILTER ---
-                let current_atr = self.last_atr_value; // <--- Берем сохраненное значение
+                let current_atr = self.last_atr_value;
                 let current_price = tick.price.to_f64().unwrap_or(1.0);
-
-                // ATR в процентах от цены
                 let vol_pct = current_atr / current_price;
 
                 if vol_pct < self.min_volatility {
-                    // Рынок "спит", пропускаем
                     return Ok(Signal::Hold);
                 }
 
@@ -201,19 +199,27 @@ impl Strategy for RsiBollingerStrategy {
             Some(pos) => {
                 let mut state_changed = false;
 
-                // TRAILING STOP LOGIC
                 if tick.price > pos.highest_price {
                     pos.highest_price = tick.price;
                     state_changed = true;
                 }
 
-                let trailing_stop_price =
-                    pos.highest_price * (Decimal::ONE - self.trailing_callback);
+                // --- DYNAMIC TRAILING STOP (ATR BASED) ---
+                let current_atr_dec = Decimal::from_f64(self.last_atr_value).unwrap_or_default();
+                let mut stop_dist = current_atr_dec * self.atr_multiplier;
+
+                // Sanity Check: Минимальный стоп 0.1%, чтобы не выбивало шумом при нулевом ATR
+                let min_dist = tick.price * Decimal::from_str("0.001").unwrap();
+                if stop_dist < min_dist {
+                    stop_dist = min_dist;
+                }
+
+                let trailing_stop_price = pos.highest_price - stop_dist;
 
                 if tick.price < trailing_stop_price {
                     info!(
-                        "🛡️ TRAILING STOP: Price {} < High {} - 0.2%",
-                        tick.price, pos.highest_price
+                        "🛡️ DYNAMIC TRAILING: Price {} < Stop {} (High {} - Dist {})",
+                        tick.price, trailing_stop_price, pos.highest_price, stop_dist
                     );
                     return Ok(Signal::Advice(Side::Sell, tick.price));
                 }

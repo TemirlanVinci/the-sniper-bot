@@ -12,6 +12,8 @@ pub struct StrategyConfig {
     pub bb_std_dev: f64,
     // Добавили поле для фильтра волатильности
     pub min_volatility: Decimal,
+    // Множитель ATR для динамического стопа
+    pub atr_multiplier: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
