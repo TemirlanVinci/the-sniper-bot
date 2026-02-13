@@ -1,4 +1,4 @@
-// src/strategies/scalper.rs
+use crate::config::StrategyConfig; // <--- Добавили импорт конфига
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker};
 use anyhow::Result;
@@ -50,22 +50,29 @@ pub struct RsiBollingerStrategy {
     last_bb_values: Option<(f64, f64, f64)>,
     position: Option<Position>,
 
-    // Параметры стратегии
-    obi_threshold: Decimal,     // 0.2
-    trailing_callback: Decimal, // 0.002 (0.2%)
+    // Параметры
+    obi_threshold: Decimal,
+    trailing_callback: Decimal,
 }
 
 impl RsiBollingerStrategy {
-    pub fn new(symbol: String) -> Self {
+    // ОБНОВЛЕНО: Добавили аргумент config: StrategyConfig
+    pub fn new(symbol: String, config: StrategyConfig) -> Self {
         Self {
             symbol,
-            rsi: RelativeStrengthIndex::new(14).unwrap(),
-            bb: BollingerBands::new(20, 2.0).unwrap(),
+            // Используем настройки из конфига
+            rsi: RelativeStrengthIndex::new(config.rsi_period).unwrap(),
+            bb: BollingerBands::new(config.bb_period, config.bb_std_dev).unwrap(),
+
             current_candle: None,
             last_rsi_value: 50.0,
             last_bb_values: None,
             position: None,
-            obi_threshold: Decimal::from_str("0.2").unwrap(),
+
+            // Конвертируем f64 из конфига в Decimal
+            obi_threshold: Decimal::from_f64(config.obi_threshold).unwrap_or(Decimal::ZERO),
+
+            // Этот параметр пока оставил хардкодом (0.2%), можно тоже вынести в конфиг позже
             trailing_callback: Decimal::from_str("0.002").unwrap(),
         }
     }
@@ -93,12 +100,16 @@ impl Strategy for RsiBollingerStrategy {
     }
 
     async fn init(&mut self) -> Result<()> {
-        info!("🚀 Strategy {} initialized (Futures Mode)", self.name());
+        info!(
+            "🚀 Strategy {} initialized with OBI Thresh: {}",
+            self.name(),
+            self.obi_threshold
+        );
         Ok(())
     }
 
     async fn on_tick(&mut self, tick: &Ticker) -> Result<Signal> {
-        // 1. Candle Logic (Time-based aggregation)
+        // 1. Candle Logic
         let tick_minute_start = (tick.timestamp / 60_000) * 60_000;
         match self.current_candle.clone() {
             Some(mut candle) => {
@@ -121,8 +132,7 @@ impl Strategy for RsiBollingerStrategy {
         };
         let bb_lower = Decimal::from_f64(bb_lower_f).unwrap_or_default();
 
-        // 2. OBI Calculation (Real-time Order Flow)
-        // OBI = (BidQty - AskQty) / (BidQty + AskQty)
+        // 2. OBI Calculation
         let total_qty = tick.bid_qty + tick.ask_qty;
         let obi = if !total_qty.is_zero() {
             (tick.bid_qty - tick.ask_qty) / total_qty
@@ -132,25 +142,21 @@ impl Strategy for RsiBollingerStrategy {
 
         match &mut self.position {
             None => {
-                // ENTRY LOGIC: RSI Oversold + Positive Order Book Imbalance
-                // RSI < 30 AND OBI > 0.2
+                // ENTRY LOGIC
                 if tick.price < bb_lower && self.last_rsi_value < 30.0 && obi > self.obi_threshold {
                     info!(
-                        "⚡ LONG SIGNAL: RSI {:.2} < 30 & OBI {:.2} > 0.2",
-                        self.last_rsi_value, obi
+                        "⚡ LONG SIGNAL: RSI {:.2} < 30 & OBI {:.2} > {}",
+                        self.last_rsi_value, obi, self.obi_threshold
                     );
                     return Ok(Signal::Advice(Side::Buy, tick.price));
                 }
             }
             Some(pos) => {
                 // 3. TRAILING STOP LOGIC
-                // Обновляем High Watermark
                 if tick.price > pos.highest_price {
                     pos.highest_price = tick.price;
-                    // info!("📈 New High: {}", pos.highest_price);
                 }
 
-                // Расчет цены выхода
                 let trailing_stop_price =
                     pos.highest_price * (Decimal::ONE - self.trailing_callback);
 
@@ -162,7 +168,6 @@ impl Strategy for RsiBollingerStrategy {
                     return Ok(Signal::Advice(Side::Sell, tick.price));
                 }
 
-                // Hard Stop Loss (Backup) - 1%
                 let hard_stop = pos.entry_price * Decimal::from_str("0.99").unwrap();
                 if tick.price < hard_stop {
                     info!("🛑 HARD STOP LOSS");

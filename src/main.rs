@@ -1,91 +1,93 @@
-// src/main.rs
-use crate::connectors::binance::BinanceClient;
-use crate::connectors::traits::StreamClient;
-use crate::core::engine::TradingEngine;
-use crate::strategies::scalper::RsiBollingerStrategy;
-use dotenvy::dotenv;
-use std::env;
-use tokio::sync::mpsc;
-use tracing::{error, info};
-use tracing_appender::rolling;
-use tracing_subscriber::fmt::writer::MakeWriterExt;
-
+mod config;
 mod connectors;
 mod core;
 mod strategies;
 mod tui;
 mod types;
-mod utils;
+mod utils; // Если есть
+
+use crate::config::AppConfig;
+use crate::connectors::binance::BinanceClient;
+use crate::connectors::traits::StreamClient;
+use crate::core::engine::TradingEngine;
+use crate::strategies::scalper::RsiBollingerStrategy;
+use tokio::signal;
+use tokio::sync::mpsc;
+use tracing::{error, info};
+use tracing_appender::rolling;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv().ok();
+    // 1. Загружаем .env файл (чтобы APP_API_KEY стали доступны)
+    dotenvy::dotenv().ok();
 
-    // --- 1. Async Non-blocking Logging ---
-    let file_appender = rolling::daily("logs", "sniper.log");
+    // 2. Настраиваем логи (пишем в файл, чтобы не ломать TUI в консоли)
+    let file_appender = rolling::daily("logs", "bot.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
-        .with_ansi(false)
+        .with_ansi(false) // Убираем цвета из файла логов
         .init();
 
-    info!("Starting The Sniper Bot (Futures Edition)...");
+    // 3. Загружаем конфиг (Settings.toml + .env)
+    let config = AppConfig::new()
+        .expect("❌ Ошибка: Не удалось загрузить конфиг! Проверь Settings.toml и .env");
 
-    let api_key = env::var("BINANCE_API_KEY").unwrap_or_default();
-    let secret_key = env::var("BINANCE_SECRET_KEY").unwrap_or_default();
-    let live_trading = env::var("LIVE_TRADING")
-        .unwrap_or("false".to_string())
-        .parse::<bool>()
-        .unwrap_or(false);
+    info!("🚀 Starting Sniper Bot with Symbol: {}", config.symbol);
 
-    let symbol = "BTCUSDT";
+    // 4. Инициализация компонентов
+    let mut binance_client = BinanceClient::new(config.api_key.clone(), config.secret_key.clone());
 
-    // --- 2. Setup Clients & Channels ---
-    let mut binance_client = BinanceClient::new(api_key, secret_key);
-
-    // ВАЖНО: Настройка Фьючерсов (Плечо 5x + Isolated Margin)
-    // Делаем это ДО клонирования клиента
-    if live_trading {
-        info!("Setting up Futures parameters for {}...", symbol);
-        match binance_client.init_futures_settings(symbol, 5).await {
-            Ok(_) => info!("Futures settings applied successfully."),
-            Err(e) => error!(
-                "Failed to set futures settings: {}. Continuing anyway...",
-                e
-            ),
-        }
+    // Применяем настройки плеча
+    if let Err(e) = binance_client
+        .init_futures_settings(&config.symbol, config.leverage)
+        .await
+    {
+        error!("⚠️ Failed to set leverage: {}", e);
     }
 
-    let execution_client = Box::new(binance_client.clone());
-    let strategy = RsiBollingerStrategy::new(symbol.to_string());
+    let strategy = RsiBollingerStrategy::new(config.symbol.clone(), config.strategy);
+    let execution_handler = Box::new(binance_client.clone());
 
-    // Bounded Channel (Backpressure)
+    // Каналы связи
     let (ticker_tx, ticker_rx) = mpsc::channel(100);
-    // UI Channel
     let (ui_tx, ui_rx) = mpsc::channel(100);
 
-    // --- 3. Start WebSocket Stream ---
-    binance_client.subscribe_ticker(symbol, ticker_tx).await?;
+    // 5. Запуск потока данных (WebSocket)
+    binance_client
+        .subscribe_ticker(&config.symbol, ticker_tx)
+        .await?;
 
-    // --- 4. Start Engine Actor ---
-    let engine_ui_tx = ui_tx.clone();
-    tokio::spawn(async move {
+    // 6. Запуск движка (в фоне)
+    let engine_handle = tokio::spawn(async move {
         let mut engine = TradingEngine::new(
-            execution_client,
+            execution_handler,
             strategy,
             ticker_rx,
-            engine_ui_tx,
-            live_trading,
+            ui_tx,
+            true, // Live Mode
         );
-
         if let Err(e) = engine.run().await {
-            error!("FATAL Engine Error: {}", e);
+            error!("❌ Engine CRITICAL error: {}", e);
         }
     });
 
-    // --- 5. Start TUI ---
-    tui::run(ui_rx, symbol.to_string()).await?;
+    // 7. Обработка выхода (Ctrl+C)
+    tokio::spawn(async move {
+        signal::ctrl_c().await.unwrap();
+        info!("🛑 Shutdown signal received.");
+        // Тут можно добавить логику экстренного закрытия позиций
+        std::process::exit(0);
+    });
 
+    // 8. Запуск TUI (Интерфейс) - блокирует основной поток
+    // Убедись, что src/tui/mod.rs заполнен кодом из прошлого ответа!
+    let app = tui::App::new(ui_rx, config.symbol.clone());
+    if let Err(e) = app.run().await {
+        eprintln!("TUI Error: {}", e); // Пишем в stderr, если TUI упал
+    }
+
+    let _ = engine_handle.await;
     Ok(())
 }

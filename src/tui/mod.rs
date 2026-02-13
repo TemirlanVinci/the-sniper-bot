@@ -1,5 +1,5 @@
 // src/tui/mod.rs
-use crate::types::{Signal, UiEvent}; // Ticker убран, так как не используется
+use crate::types::{Signal, UiEvent};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -12,49 +12,54 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
-    Frame,
-    Terminal, // Добавлен Frame
+    Frame, Terminal,
 };
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::io;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub struct App {
-    current_price: Option<Decimal>,
-    logs: Vec<String>,
-    signals: Vec<String>,
     receiver: mpsc::Receiver<UiEvent>,
     symbol: String,
+    // State
+    price: Decimal,
+    rsi: f64,
+    obi: Decimal,
+    pnl: Option<Decimal>,
+    logs: Vec<String>,
+    active_signal: String,
 }
 
 impl App {
     pub fn new(receiver: mpsc::Receiver<UiEvent>, symbol: String) -> Self {
         Self {
-            current_price: None,
-            logs: vec![],
-            signals: vec![],
             receiver,
             symbol,
+            price: Decimal::ZERO,
+            rsi: 50.0,
+            obi: Decimal::ZERO,
+            pnl: None,
+            logs: vec![],
+            active_signal: "WAITING".to_string(),
         }
     }
 
-    pub async fn run_loop(mut self) -> Result<()> {
-        // Setup terminal
+    pub async fn run(mut self) -> Result<()> {
+        // Setup Terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let tick_rate = Duration::from_millis(100);
-
         loop {
-            // Теперь draw передает Frame без дженерика B
+            // Draw
             terminal.draw(|f| self.ui(f))?;
 
-            // Non-blocking event check
-            if event::poll(Duration::from_millis(0))? {
+            // Input (Non-blocking check)
+            if event::poll(Duration::from_millis(10))? {
                 if let Event::Key(key) = event::read()? {
                     if let KeyCode::Char('q') = key.code {
                         break;
@@ -62,115 +67,124 @@ impl App {
                 }
             }
 
-            // Process channel events
+            // Data updates
             while let Ok(event) = self.receiver.try_recv() {
                 match event {
-                    UiEvent::TickerUpdate(t) => {
-                        self.current_price = Some(t.price);
-                    }
-                    UiEvent::Signal(s) => {
-                        let msg = match s {
-                            Signal::Advice(side, price) => {
-                                format!("SIGNAL: {:?} @ {}", side, price)
-                            }
-                            Signal::Hold => "SIGNAL: HOLD".to_string(),
-                        };
-                        self.signals.push(msg);
-                        if self.signals.len() > 20 {
-                            self.signals.remove(0);
+                    UiEvent::TickerUpdate(t) => self.price = t.price,
+                    UiEvent::Signal(s) => match s {
+                        Signal::Advice(side, price) => {
+                            self.active_signal = format!("{:?} @ {}", side, price)
                         }
-                    }
+                        Signal::Hold => self.active_signal = "HOLD".to_string(),
+                    },
                     UiEvent::Log(l) => {
                         self.logs.push(l);
-                        if self.logs.len() > 20 {
+                        if self.logs.len() > 15 {
                             self.logs.remove(0);
                         }
                     }
+                    UiEvent::Snapshot(snap) => {
+                        self.rsi = snap.rsi;
+                        self.obi = snap.obi;
+                        self.pnl = snap.position_pnl;
+                    }
                 }
             }
-
-            tokio::time::sleep(tick_rate).await;
         }
 
-        // Restore terminal
+        // Cleanup
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
-
         Ok(())
     }
 
-    // ИСПРАВЛЕНИЕ ЗДЕСЬ: Удален <B: Backend> и Frame<B> заменен на Frame
     fn ui(&self, f: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
             .constraints(
                 [
-                    Constraint::Length(3),      // Header
-                    Constraint::Percentage(50), // Signals
-                    Constraint::Percentage(50), // Logs
+                    Constraint::Length(3), // Header
+                    Constraint::Length(3), // KPI Row
+                    Constraint::Length(3), // Position
+                    Constraint::Min(5),    // Logs
                 ]
                 .as_ref(),
             )
             .split(f.size());
 
-        // 1. Header with Price
-        let price_text = match self.current_price {
-            Some(p) => format!("{:.2}", p),
-            None => "Waiting...".to_string(),
+        // 1. Header
+        let title = format!(" THE SNIPER BOT | {} | {} ", self.symbol, self.price);
+        let header = Paragraph::new(title)
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::default().borders(Borders::ALL));
+        f.render_widget(header, chunks[0]);
+
+        // 2. Indicators
+        let rsi_color = if self.rsi > 70.0 {
+            Color::Red
+        } else if self.rsi < 30.0 {
+            Color::Green
+        } else {
+            Color::Gray
+        };
+        let obi_val = self.obi.to_f64().unwrap_or(0.0);
+        let obi_color = if obi_val > 0.2 {
+            Color::Green
+        } else if obi_val < -0.2 {
+            Color::Red
+        } else {
+            Color::Gray
         };
 
-        let title = Paragraph::new(Line::from(vec![
-            Span::styled("Sniper Bot ", Style::default().fg(Color::Green)),
-            Span::styled(&self.symbol, Style::default().fg(Color::Cyan)),
-            Span::raw(" | Price: "),
-            Span::styled(
-                price_text,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+        let indicators = Paragraph::new(Line::from(vec![
+            Span::raw(" RSI: "),
+            Span::styled(format!("{:.2}", self.rsi), Style::default().fg(rsi_color)),
+            Span::raw(" | OBI: "),
+            Span::styled(format!("{:.4}", self.obi), Style::default().fg(obi_color)),
+            Span::raw(" | Last Sig: "),
+            Span::styled(&self.active_signal, Style::default().fg(Color::Yellow)),
         ]))
-        .block(Block::default().borders(Borders::ALL).title("Status"));
+        .block(Block::default().borders(Borders::ALL).title(" Indicators "));
+        f.render_widget(indicators, chunks[1]);
 
-        f.render_widget(title, chunks[0]);
+        // 3. Position
+        let pnl_text = match self.pnl {
+            Some(p) => format!(" OPEN POSITION | PnL: {:.2}%", p * Decimal::from(100)),
+            None => " NO POSITION".to_string(),
+        };
+        let pos_color = if self.pnl.is_some() {
+            Color::LightGreen
+        } else {
+            Color::Gray
+        };
 
-        // 2. Signals
-        let signals: Vec<ListItem> = self
-            .signals
-            .iter()
-            .rev()
-            .map(|s| {
-                ListItem::new(Line::from(Span::styled(
-                    s,
-                    Style::default().fg(Color::Green),
-                )))
-            })
-            .collect();
+        let position_widget = Paragraph::new(pnl_text)
+            .style(Style::default().fg(pos_color))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Position Status "),
+            );
+        f.render_widget(position_widget, chunks[2]);
 
-        let signals_list = List::new(signals).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Signals History"),
-        );
-        f.render_widget(signals_list, chunks[1]);
-
-        // 3. Logs
-        let logs: Vec<ListItem> = self
+        // 4. Logs
+        let log_items: Vec<ListItem> = self
             .logs
             .iter()
             .rev()
-            .map(|l| ListItem::new(Line::from(Span::raw(l))))
+            .map(|l| ListItem::new(Span::raw(l)))
             .collect();
-
-        let logs_list =
-            List::new(logs).block(Block::default().borders(Borders::ALL).title("System Logs"));
-        f.render_widget(logs_list, chunks[2]);
+        let logs_list = List::new(log_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" System Logs "),
+        );
+        f.render_widget(logs_list, chunks[3]);
     }
-}
-
-pub async fn run(receiver: mpsc::Receiver<UiEvent>, symbol: String) -> Result<()> {
-    let app = App::new(receiver, symbol);
-    app.run_loop().await
 }

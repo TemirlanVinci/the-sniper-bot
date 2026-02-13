@@ -12,11 +12,11 @@ pub enum Side {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticker {
     pub symbol: String,
-    pub price: Decimal,     // Mid-Price для свечей
-    pub bid_price: Decimal, // Для точного входа
+    pub price: Decimal, // Mid-Price
+    pub bid_price: Decimal,
     pub ask_price: Decimal,
-    pub bid_qty: Decimal, // Для OBI
-    pub ask_qty: Decimal, // Для OBI
+    pub bid_qty: Decimal,
+    pub ask_qty: Decimal,
     pub timestamp: u64,
 }
 
@@ -32,10 +32,7 @@ pub struct Position {
     pub quantity: Decimal,
     pub entry_price: Decimal,
     pub unrealized_pnl: Decimal,
-
-    // Новое поле для Trailing Stop
-    // Хранит максимальную цену с момента открытия (для Long)
-    pub highest_price: Decimal,
+    pub highest_price: Decimal, // Для Trailing Stop
 }
 
 #[derive(Debug, Default, Clone)]
@@ -51,9 +48,19 @@ pub struct OrderResponse {
     pub status: String,
 }
 
+// --- Новые структуры для TUI ---
+
+#[derive(Debug, Clone, Default)]
+pub struct StrategySnapshot {
+    pub rsi: f64,
+    pub obi: Decimal,
+    pub position_pnl: Option<Decimal>,
+}
+
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     TickerUpdate(Ticker),
     Signal(Signal),
+    Snapshot(StrategySnapshot), // <-- Добавили для обновления дашборда
     Log(String),
 }

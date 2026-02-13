@@ -14,7 +14,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -33,18 +33,15 @@ impl BinanceClient {
             api_key,
             secret_key,
             http_client: Client::new(),
-            base_rest_url: "https://fapi.binance.com".to_string(), // Futures API
+            base_rest_url: "https://fapi.binance.com".to_string(),
         }
     }
 
-    /// Инициализация настроек Фьючерсов: Плечо и Тип маржи
+    /// Настройка плеча и типа маржи
     pub async fn init_futures_settings(&self, symbol: &str, leverage: u8) -> Result<()> {
-        info!(
-            "⚙️ Configuring Futures: Leverage {}x, Isolated Margin",
-            leverage
-        );
+        info!("⚙️ Configuring Futures: Leverage {}x, Isolated", leverage);
 
-        // 1. Установка типа маржи (ISOLATED)
+        // 1. Margin Type
         let _ = self
             .send_signed_request::<serde_json::Value>(
                 Method::POST,
@@ -54,9 +51,9 @@ impl BinanceClient {
                     ("marginType", "ISOLATED".to_string()),
                 ],
             )
-            .await; // Игнорируем ошибку, если уже установлено "No need to change"
+            .await;
 
-        // 2. Установка плеча
+        // 2. Leverage
         let _ = self
             .send_signed_request::<serde_json::Value>(
                 Method::POST,
@@ -112,7 +109,6 @@ impl BinanceClient {
 #[async_trait]
 impl ExecutionHandler for BinanceClient {
     async fn get_balance(&self, asset: &str) -> Result<Decimal> {
-        // Futures Account Endpoint (v2)
         #[derive(Deserialize)]
         struct Asset {
             asset: String,
@@ -152,9 +148,8 @@ impl ExecutionHandler for BinanceClient {
             Side::Sell => "SELL",
         };
 
-        // Futures logic: LIMIT or MARKET
         let (type_str, time_in_force, price_val) = match price {
-            Some(p) => ("LIMIT", Some("GTC"), Some(p)), // GTC для лимиток на фьючерсах надежнее
+            Some(p) => ("LIMIT", Some("GTC"), Some(p)),
             None => ("MARKET", None, None),
         };
 
@@ -180,7 +175,6 @@ impl ExecutionHandler for BinanceClient {
             status: String,
         }
 
-        // Endpoint v1/order (POST) is same for Futures but different base URL
         let resp: BinanceOrderResponse = self
             .send_signed_request(Method::POST, "/fapi/v1/order", params)
             .await?;
@@ -207,63 +201,63 @@ impl ExecutionHandler for BinanceClient {
 #[async_trait]
 impl StreamClient for BinanceClient {
     async fn subscribe_ticker(&mut self, symbol: &str, sender: mpsc::Sender<Ticker>) -> Result<()> {
-        // Futures WebSocket URL + BookTicker Stream
-        // Example: wss://fstream.binance.com/ws/btcusdt@bookTicker
         let ws_url = format!(
             "wss://fstream.binance.com/ws/{}@bookTicker",
             symbol.to_lowercase()
         );
         let url = Url::parse(&ws_url)?;
-
-        info!("🔥 Connecting to Futures BookTicker for OBI: {}", symbol);
         let symbol_clone = symbol.to_string();
+
+        info!("🔌 Initializing WebSocket connection for {}...", symbol);
 
         tokio::spawn(async move {
             loop {
+                info!("Connecting to WS: {}", url);
                 match connect_async(url.clone()).await {
                     Ok((ws_stream, _)) => {
-                        info!("Connected: {}", symbol_clone);
+                        info!("✅ WS Connected: {}", symbol_clone);
                         let (_, mut read) = ws_stream.split();
 
                         while let Some(msg_result) = read.next().await {
                             match msg_result {
                                 Ok(msg) => {
                                     if let Ok(text) = msg.to_text() {
-                                        // Десериализация BookTicker для OBI
-                                        match serde_json::from_str::<BookTickerEvent>(text) {
-                                            Ok(event) => {
-                                                // Mid-price для свечей
-                                                let mid_price = (event.best_bid_price
-                                                    + event.best_ask_price)
-                                                    / Decimal::from(2);
+                                        if let Ok(event) =
+                                            serde_json::from_str::<BookTickerEvent>(text)
+                                        {
+                                            let mid_price = (event.best_bid_price
+                                                + event.best_ask_price)
+                                                / Decimal::from(2);
 
-                                                let ticker = Ticker {
-                                                    symbol: symbol_clone.clone(),
-                                                    price: mid_price,
-                                                    bid_price: event.best_bid_price,
-                                                    ask_price: event.best_ask_price,
-                                                    bid_qty: event.best_bid_qty,
-                                                    ask_qty: event.best_ask_qty,
-                                                    timestamp: event.event_time, // 'E' or 'T' field
-                                                };
+                                            let ticker = Ticker {
+                                                symbol: symbol_clone.clone(),
+                                                price: mid_price,
+                                                bid_price: event.best_bid_price,
+                                                ask_price: event.best_ask_price,
+                                                bid_qty: event.best_bid_qty,
+                                                ask_qty: event.best_ask_qty,
+                                                timestamp: event.event_time,
+                                            };
 
-                                                if let Err(_) = sender.try_send(ticker) {
-                                                    // Drop tick if channel full
-                                                }
+                                            if sender.try_send(ticker).is_err() {
+                                                // Channel full/closed
                                             }
-                                            Err(e) => error!("WS Parse Error: {}", e),
                                         }
                                     }
                                 }
-                                Err(_) => break, // Reconnect
+                                Err(e) => {
+                                    error!("❌ WS Read Error: {}. Reconnecting...", e);
+                                    break; // Break inner loop to trigger reconnect
+                                }
                             }
                         }
+                        warn!("⚠️ WS Stream ended. Reconnecting...");
                     }
                     Err(e) => {
-                        error!("WS Connect Error: {}. Retrying...", e);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        error!("❌ WS Connection Failed: {}. Retrying in 5s...", e);
                     }
                 }
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         });
 

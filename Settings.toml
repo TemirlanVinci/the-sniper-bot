@@ -1,0 +1,14 @@
+# Оставь пустыми, они подтянутся из .env
+api_key = ""
+secret_key = ""
+
+# Настройки торговли
+symbol = "BTCUSDT"
+leverage = 5
+order_qty_usdt = 20.0
+
+[strategy]
+rsi_period = 14
+obi_threshold = 0.15
+bb_period = 20
+bb_std_dev = 2.0
