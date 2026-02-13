@@ -1,22 +1,23 @@
-// src/core/engine.rs
+use crate::config::AppConfig;
 use crate::connectors::traits::ExecutionHandler;
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker, UiEvent};
 use anyhow::Result;
+use rust_decimal::prelude::FromPrimitive; // <--- ADDED THIS
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::str::FromStr;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn}; // Added warn
+use tracing::{info, warn};
 
-// Простое персистентное состояние
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct EngineState {
     active_position: Option<Position>,
 }
 
 pub struct TradingEngine<S> {
+    config: AppConfig,
     execution_handler: Box<dyn ExecutionHandler>,
     strategy: S,
     ticker_receiver: mpsc::Receiver<Ticker>,
@@ -30,6 +31,7 @@ where
     S: Strategy,
 {
     pub fn new(
+        config: AppConfig,
         execution_handler: Box<dyn ExecutionHandler>,
         strategy: S,
         ticker_receiver: mpsc::Receiver<Ticker>,
@@ -37,6 +39,7 @@ where
         live_mode: bool,
     ) -> Self {
         Self {
+            config,
             execution_handler,
             strategy,
             ticker_receiver,
@@ -72,13 +75,11 @@ where
         info!("Engine loop running. Live Mode: {}", self.live_mode);
 
         while let Some(ticker) = self.ticker_receiver.recv().await {
-            // Forward ticker to UI
             let _ = self
                 .ui_sender
                 .send(UiEvent::TickerUpdate(ticker.clone()))
                 .await;
 
-            // Strategy Tick
             let signal = self.strategy.on_tick(&ticker).await?;
 
             match signal {
@@ -104,7 +105,7 @@ where
             .await;
 
         if !self.live_mode {
-            // Simulation
+            // Simulation logic
             let fake_pos = match side {
                 Side::Buy => Some(Position {
                     symbol: ticker.symbol.clone(),
@@ -121,15 +122,29 @@ where
         }
 
         // --- LIVE EXECUTION LOGIC ---
-        // TODO: Перенести размер лота в конфиг
-        let quantity = Decimal::from_str("0.002").unwrap();
 
+        // 1. Dynamic Quantity Calculation
+        let order_usdt =
+            Decimal::from_f64(self.config.order_size_usdt).unwrap_or(Decimal::from(10));
+        let raw_qty = order_usdt / current_price;
+        let quantity = self.execution_handler.normalize_quantity(raw_qty);
+
+        info!(
+            "Calculated Quantity: {} (Raw: {}) based on {} USDT",
+            quantity, raw_qty, order_usdt
+        );
+
+        if quantity.is_zero() {
+            warn!("⚠️ Quantity is zero (Order size too small for price). Aborting.");
+            return Ok(());
+        }
+
+        // 2. Balance Check
         let required_asset = match side {
             Side::Buy => "USDT",
-            Side::Sell => "BTC",
+            Side::Sell => "BTC", // TODO: Should be base asset from config (parse from symbol)
         };
 
-        // 1. Balance Check
         let balance = self
             .execution_handler
             .get_balance(required_asset)
@@ -137,26 +152,25 @@ where
             .unwrap_or(Decimal::ZERO);
 
         let required_amt = match side {
-            Side::Buy => quantity * current_price / Decimal::from(5),
+            Side::Buy => quantity * current_price,
             Side::Sell => quantity,
         };
 
-        if balance < required_amt {
-            // info!("Warning: Local balance check low, trying anyway...");
-        }
+        // Optional: Add balance check logic here if strictly required
+        // if balance < required_amt { ... }
 
-        // 2. Place Order (Limit IOC)
+        // 3. Place Order (Limit IOC with Dynamic Precision)
         let slippage = Decimal::from_str("0.001").unwrap(); // 0.1%
-        let limit_price = match side {
+        let target_price = match side {
             Side::Buy => current_price * (Decimal::ONE + slippage),
             Side::Sell => current_price * (Decimal::ONE - slippage),
         };
-        let limit_price = limit_price.round_dp(2);
 
-        // FIXED: Only update state if the order was ACTUALLY filled
+        let final_price = self.execution_handler.normalize_price(target_price);
+
         match self
             .execution_handler
-            .place_order(&ticker.symbol, side, quantity, Some(limit_price))
+            .place_order(&ticker.symbol, side, quantity, Some(final_price))
             .await
         {
             Ok(order) => {
@@ -166,9 +180,9 @@ where
                         let pos = Position {
                             symbol: ticker.symbol.clone(),
                             quantity,
-                            entry_price: limit_price,
+                            entry_price: final_price,
                             unrealized_pnl: Decimal::ZERO,
-                            highest_price: limit_price,
+                            highest_price: final_price,
                         };
                         self.strategy.update_position(Some(pos.clone()));
                         self.save_state(Some(pos));
@@ -180,8 +194,7 @@ where
                 }
             }
             Err(e) => {
-                // FIXED: Log warning and DO NOT update strategy state
-                warn!("⚠️ Slippage too high, entry missed or error: {}", e);
+                warn!("⚠️ Execution Error (Slippage/IOC/Balance): {}", e);
             }
         }
 

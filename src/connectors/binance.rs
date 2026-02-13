@@ -1,4 +1,3 @@
-// src/connectors/binance.rs
 use crate::connectors::messages::BookTickerEvent;
 use crate::connectors::traits::{ExecutionHandler, StreamClient};
 use crate::types::{OrderResponse, Side, Ticker};
@@ -25,6 +24,9 @@ pub struct BinanceClient {
     secret_key: String,
     http_client: Client,
     base_rest_url: String,
+    // Exchange Info cache
+    tick_size: Decimal,
+    step_size: Decimal,
 }
 
 impl BinanceClient {
@@ -34,14 +36,62 @@ impl BinanceClient {
             secret_key,
             http_client: Client::new(),
             base_rest_url: "https://fapi.binance.com".to_string(),
+            tick_size: Decimal::new(1, 2), // Default 0.01
+            step_size: Decimal::new(1, 3), // Default 0.001
         }
     }
 
-    /// Настройка плеча и типа маржи
+    /// Fetches exchange info to get real Precision/tickSize/stepSize
+    pub async fn fetch_exchange_info(&mut self, symbol: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct ExchangeInfo {
+            symbols: Vec<SymbolInfo>,
+        }
+        #[derive(Deserialize)]
+        struct SymbolInfo {
+            symbol: String,
+            filters: Vec<serde_json::Value>,
+        }
+
+        info!("🔍 Fetching Exchange Info for {}...", symbol);
+        let resp: ExchangeInfo = self
+            .http_client
+            .get(format!("{}/fapi/v1/exchangeInfo", self.base_rest_url))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let symbol_info = resp
+            .symbols
+            .into_iter()
+            .find(|s| s.symbol == symbol)
+            .ok_or_else(|| anyhow!("Symbol {} not found in exchange info", symbol))?;
+
+        for filter in symbol_info.filters {
+            if let Some(filter_type) = filter.get("filterType").and_then(|v| v.as_str()) {
+                match filter_type {
+                    "PRICE_FILTER" => {
+                        if let Some(tick) = filter.get("tickSize").and_then(|v| v.as_str()) {
+                            self.tick_size = Decimal::from_str(tick).unwrap_or(self.tick_size);
+                            info!("✅ Set Tick Size: {}", self.tick_size);
+                        }
+                    }
+                    "LOT_SIZE" => {
+                        if let Some(step) = filter.get("stepSize").and_then(|v| v.as_str()) {
+                            self.step_size = Decimal::from_str(step).unwrap_or(self.step_size);
+                            info!("✅ Set Step Size: {}", self.step_size);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn init_futures_settings(&self, symbol: &str, leverage: u8) -> Result<()> {
         info!("⚙️ Configuring Futures: Leverage {}x, Isolated", leverage);
-
-        // 1. Margin Type
         let _ = self
             .send_signed_request::<serde_json::Value>(
                 Method::POST,
@@ -53,7 +103,6 @@ impl BinanceClient {
             )
             .await;
 
-        // 2. Leverage
         let _ = self
             .send_signed_request::<serde_json::Value>(
                 Method::POST,
@@ -64,7 +113,6 @@ impl BinanceClient {
                 ],
             )
             .await?;
-
         Ok(())
     }
 
@@ -108,6 +156,20 @@ impl BinanceClient {
 
 #[async_trait]
 impl ExecutionHandler for BinanceClient {
+    fn normalize_price(&self, price: Decimal) -> Decimal {
+        if self.tick_size.is_zero() {
+            return price.round_dp(2);
+        }
+        (price / self.tick_size).floor() * self.tick_size
+    }
+
+    fn normalize_quantity(&self, quantity: Decimal) -> Decimal {
+        if self.step_size.is_zero() {
+            return quantity.round_dp(3);
+        }
+        (quantity / self.step_size).floor() * self.step_size
+    }
+
     async fn get_balance(&self, asset: &str) -> Result<Decimal> {
         #[derive(Deserialize)]
         struct Asset {
@@ -148,7 +210,6 @@ impl ExecutionHandler for BinanceClient {
             Side::Sell => "SELL",
         };
 
-        // FIXED: Changed "GTC" to "IOC" to prevent orders from resting in the book
         let (type_str, time_in_force, price_val) = match price {
             Some(p) => ("LIMIT", Some("IOC"), Some(p)),
             None => ("MARKET", None, None),
@@ -180,14 +241,12 @@ impl ExecutionHandler for BinanceClient {
             .send_signed_request(Method::POST, "/fapi/v1/order", params)
             .await?;
 
-        // FIXED: Check status. Fail if not filled immediately.
         match resp.status.as_str() {
             "FILLED" | "PARTIALLY_FILLED" => Ok(OrderResponse {
                 id: resp.order_id.to_string(),
                 symbol: resp.symbol,
                 status: resp.status,
             }),
-            // Treat EXPIRED (IOC not met) or CANCELED as a failure
             _ => Err(anyhow!(
                 "Order not filled (Slippage/IOC). Status: {}",
                 resp.status
@@ -247,16 +306,13 @@ impl StreamClient for BinanceClient {
                                                 ask_qty: event.best_ask_qty,
                                                 timestamp: event.event_time,
                                             };
-
-                                            if sender.try_send(ticker).is_err() {
-                                                // Channel full/closed
-                                            }
+                                            if sender.try_send(ticker).is_err() {}
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     error!("❌ WS Read Error: {}. Reconnecting...", e);
-                                    break; // Break inner loop to trigger reconnect
+                                    break;
                                 }
                             }
                         }
