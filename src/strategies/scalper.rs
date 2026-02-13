@@ -1,3 +1,4 @@
+// src/strategies/scalper.rs
 use crate::config::StrategyConfig;
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker};
@@ -7,7 +8,7 @@ use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use ta::indicators::{BollingerBands, RelativeStrengthIndex};
 use ta::{DataItem, Next};
-use tracing::{debug, info}; // Added debug for warm-up logging
+use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 struct CandleBuilder {
@@ -72,7 +73,7 @@ impl RsiBollingerStrategy {
             position: None,
 
             // Warm-up initialization
-            warmup_period: 50, // Default to 50 candles as requested
+            warmup_period: 50,
             processed_candles: 0,
 
             obi_threshold: Decimal::from_f64(config.obi_threshold).unwrap_or(Decimal::ZERO),
@@ -90,12 +91,10 @@ impl RsiBollingerStrategy {
             .build()
             .unwrap();
 
-        // Safety: Indicators are updated REGARDLESS of warm-up state to fill internal buffers
         self.last_rsi_value = self.rsi.next(&item);
         let bb_out = self.bb.next(&item);
         self.last_bb_values = Some((bb_out.lower, bb_out.average, bb_out.upper));
 
-        // Increment the count of valid historical points
         self.processed_candles += 1;
     }
 }
@@ -133,7 +132,7 @@ impl Strategy for RsiBollingerStrategy {
             }
         }
 
-        // 2. Warm-up Check: Suppress signals until indicators are statistically valid
+        // 2. Warm-up Check
         if self.processed_candles < self.warmup_period {
             debug!(
                 "Warming up: {} / {} candles processed",
@@ -143,7 +142,7 @@ impl Strategy for RsiBollingerStrategy {
         }
 
         // 3. Indicator Extraction
-        let (bb_lower_f, _bb_mid_f, _bb_upper_f) = match self.last_bb_values {
+        let (bb_lower_f, _, _) = match self.last_bb_values {
             Some(vals) => vals,
             None => return Ok(Signal::Hold),
         };
@@ -170,9 +169,12 @@ impl Strategy for RsiBollingerStrategy {
                 }
             }
             Some(pos) => {
+                let mut state_changed = false; // <--- Флаг изменений
+
                 // TRAILING STOP LOGIC
                 if tick.price > pos.highest_price {
                     pos.highest_price = tick.price;
+                    state_changed = true; // <--- Фиксируем обновление максимума
                 }
 
                 let trailing_stop_price =
@@ -191,6 +193,11 @@ impl Strategy for RsiBollingerStrategy {
                     info!("🛑 HARD STOP LOSS");
                     return Ok(Signal::Advice(Side::Sell, tick.price));
                 }
+
+                // <--- Если не вышли из сделки, но обновили хай — просим сохранить
+                if state_changed {
+                    return Ok(Signal::StateChanged);
+                }
             }
         }
 
@@ -199,5 +206,10 @@ impl Strategy for RsiBollingerStrategy {
 
     fn update_position(&mut self, position: Option<Position>) {
         self.position = position;
+    }
+
+    // <--- Реализация геттера
+    fn get_position(&self) -> Option<Position> {
+        self.position.clone()
     }
 }

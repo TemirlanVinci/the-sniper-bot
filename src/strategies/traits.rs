@@ -15,4 +15,7 @@ pub trait Strategy: Send + Sync {
 
     // Update position state (Some = open, None = closed)
     fn update_position(&mut self, position: Option<Position>);
+
+    // <--- НОВОЕ: Метод для получения текущего состояния (нужен Engine для сохранения)
+    fn get_position(&self) -> Option<Position>;
 }

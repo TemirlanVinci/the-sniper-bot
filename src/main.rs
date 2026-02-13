@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
             strategy,
             ticker_rx,
             ui_tx,
-            true, // Live Mode
+            false, // Live Mode
         );
         if let Err(e) = engine.run().await {
             error!("❌ Engine CRITICAL error: {}", e);

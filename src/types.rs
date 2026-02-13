@@ -23,6 +23,7 @@ pub struct Ticker {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Signal {
     Advice(Side, Decimal),
+    StateChanged, // <--- НОВОЕ: Сигнал изменения внутреннего состояния
     Hold,
 }
 
@@ -61,6 +62,6 @@ pub struct StrategySnapshot {
 pub enum UiEvent {
     TickerUpdate(Ticker),
     Signal(Signal),
-    Snapshot(StrategySnapshot), // <-- Добавили для обновления дашборда
+    Snapshot(StrategySnapshot),
     Log(String),
 }

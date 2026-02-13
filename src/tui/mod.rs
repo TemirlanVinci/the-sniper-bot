@@ -75,6 +75,8 @@ impl App {
                         Signal::Advice(side, price) => {
                             self.active_signal = format!("{:?} @ {}", side, price)
                         }
+                        // <--- Игнорируем внутренние сигналы в UI, чтобы не сбивать пользователя
+                        Signal::StateChanged => {}
                         Signal::Hold => self.active_signal = "HOLD".to_string(),
                     },
                     UiEvent::Log(l) => {

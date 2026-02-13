@@ -5,7 +5,7 @@ secret_key = ""
 # Настройки торговли
 symbol = "BTCUSDT"
 leverage = 5
-order_qty_usdt = 20.0
+order_size_usdt = 20.0
 
 [strategy]
 rsi_period = 14

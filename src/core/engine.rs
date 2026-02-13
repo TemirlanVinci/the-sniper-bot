@@ -1,3 +1,4 @@
+// src/core/engine.rs
 use crate::config::AppConfig;
 use crate::connectors::traits::ExecutionHandler;
 use crate::strategies::traits::Strategy;
@@ -77,10 +78,8 @@ where
             Ok(_) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // DROP the message. Do NOT wait.
-                // Optional: warn!("UI Channel full, dropping frame");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Critical: Receiver closed. Log error but keep engine running.
                 error!("UI Channel closed! Interface is likely dead.");
             }
         }
@@ -103,6 +102,13 @@ where
                 Signal::Advice(side, price) => {
                     self.handle_signal(side, price, &ticker).await?;
                 }
+                Signal::StateChanged => {
+                    // <--- НОВОЕ: Обработка изменения состояния (без ордеров)
+                    // Получаем актуальную позицию из стратегии (там обновилась highest_price)
+                    let current_pos = self.strategy.get_position();
+                    self.save_state(current_pos).await;
+                    info!("💾 State updated (highest_price tracked)");
+                }
                 Signal::Hold => {}
             }
         }
@@ -115,10 +121,7 @@ where
         current_price: Decimal,
         ticker: &Ticker,
     ) -> Result<()> {
-        // Critical Log: Always log signal regardless of UI state
         info!("Signal detected: {:?} @ {}", side, current_price);
-
-        // 2. Non-Blocking UI Update (Signal)
         self.send_ui_event(UiEvent::Signal(Signal::Advice(side, current_price)));
 
         if !self.live_mode {
@@ -139,8 +142,6 @@ where
         }
 
         // --- LIVE EXECUTION LOGIC ---
-
-        // 1. Dynamic Quantity Calculation
         let order_usdt =
             Decimal::from_f64(self.config.order_size_usdt).unwrap_or(Decimal::from(10));
         let raw_qty = order_usdt / current_price;
@@ -152,32 +153,15 @@ where
         );
 
         if quantity.is_zero() {
-            warn!("⚠️ Quantity is zero (Order size too small for price). Aborting.");
+            warn!("⚠️ Quantity is zero. Aborting.");
             return Ok(());
         }
 
-        // 2. Balance Check
-        let required_asset = match side {
-            Side::Buy => "USDT",
-            Side::Sell => "BTC", // TODO: Should be base asset from config (parse from symbol)
-        };
-
-        let _balance = self
-            .execution_handler
-            .get_balance(required_asset)
-            .await
-            .unwrap_or(Decimal::ZERO);
-
-        // Optional: Add balance check logic here if strictly required
-        // if balance < required_amt { ... }
-
-        // 3. Place Order (Limit IOC with Dynamic Precision)
-        let slippage = Decimal::from_str("0.001").unwrap(); // 0.1%
+        let slippage = Decimal::from_str("0.001").unwrap();
         let target_price = match side {
             Side::Buy => current_price * (Decimal::ONE + slippage),
             Side::Sell => current_price * (Decimal::ONE - slippage),
         };
-
         let final_price = self.execution_handler.normalize_price(target_price);
 
         match self
@@ -206,7 +190,7 @@ where
                 }
             }
             Err(e) => {
-                error!("⚠️ Execution Error (Slippage/IOC/Balance): {}", e);
+                error!("⚠️ Execution Error: {}", e);
             }
         }
 
