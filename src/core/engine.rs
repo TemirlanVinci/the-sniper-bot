@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::str::FromStr;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn}; // Added warn
 
 // Простое персистентное состояние
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -111,7 +111,7 @@ where
                     quantity: Decimal::from_str("0.001").unwrap(),
                     entry_price: current_price,
                     unrealized_pnl: Decimal::ZERO,
-                    highest_price: current_price, // <--- ИСПРАВЛЕНИЕ: Инициализация для трейлинга
+                    highest_price: current_price,
                 }),
                 Side::Sell => None,
             };
@@ -122,12 +122,11 @@ where
 
         // --- LIVE EXECUTION LOGIC ---
         // TODO: Перенести размер лота в конфиг
-        // ВАЖНО: Убедись, что этот объем подходит под минимальные лимиты Binance Futures (обычно ~$5-10)
         let quantity = Decimal::from_str("0.002").unwrap();
 
         let required_asset = match side {
             Side::Buy => "USDT",
-            Side::Sell => "BTC", // NOTE: На фьючерсах (USDT-M) мы всегда торгуем в USDT, но логика проверки баланса осталась старой. Пока ок.
+            Side::Sell => "BTC",
         };
 
         // 1. Balance Check
@@ -137,14 +136,11 @@ where
             .await
             .unwrap_or(Decimal::ZERO);
 
-        // Грубая оценка стоимости (без учета плеча в проверке, но биржа сама проверит маржу)
         let required_amt = match side {
-            Side::Buy => quantity * current_price / Decimal::from(5), // Учитываем плечо 5x для проверки
+            Side::Buy => quantity * current_price / Decimal::from(5),
             Side::Sell => quantity,
         };
 
-        // Убрал жесткую проверку баланса здесь, чтобы не блокировать, если расчет сложный.
-        // Лучше пусть биржа вернет ошибку "Insufficient Margin".
         if balance < required_amt {
             // info!("Warning: Local balance check low, trying anyway...");
         }
@@ -157,13 +153,14 @@ where
         };
         let limit_price = limit_price.round_dp(2);
 
+        // FIXED: Only update state if the order was ACTUALLY filled
         match self
             .execution_handler
             .place_order(&ticker.symbol, side, quantity, Some(limit_price))
             .await
         {
             Ok(order) => {
-                info!("Order Filled: {:?}", order);
+                info!("✅ Order Confirmed & Filled: {:?}", order);
                 match side {
                     Side::Buy => {
                         let pos = Position {
@@ -171,7 +168,7 @@ where
                             quantity,
                             entry_price: limit_price,
                             unrealized_pnl: Decimal::ZERO,
-                            highest_price: limit_price, // <--- ИСПРАВЛЕНИЕ: Инициализация для трейлинга
+                            highest_price: limit_price,
                         };
                         self.strategy.update_position(Some(pos.clone()));
                         self.save_state(Some(pos));
@@ -183,7 +180,8 @@ where
                 }
             }
             Err(e) => {
-                error!("Execution failed: {}", e);
+                // FIXED: Log warning and DO NOT update strategy state
+                warn!("⚠️ Slippage too high, entry missed or error: {}", e);
             }
         }
 

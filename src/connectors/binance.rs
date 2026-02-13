@@ -148,8 +148,9 @@ impl ExecutionHandler for BinanceClient {
             Side::Sell => "SELL",
         };
 
+        // FIXED: Changed "GTC" to "IOC" to prevent orders from resting in the book
         let (type_str, time_in_force, price_val) = match price {
-            Some(p) => ("LIMIT", Some("GTC"), Some(p)),
+            Some(p) => ("LIMIT", Some("IOC"), Some(p)),
             None => ("MARKET", None, None),
         };
 
@@ -179,11 +180,19 @@ impl ExecutionHandler for BinanceClient {
             .send_signed_request(Method::POST, "/fapi/v1/order", params)
             .await?;
 
-        Ok(OrderResponse {
-            id: resp.order_id.to_string(),
-            symbol: resp.symbol,
-            status: resp.status,
-        })
+        // FIXED: Check status. Fail if not filled immediately.
+        match resp.status.as_str() {
+            "FILLED" | "PARTIALLY_FILLED" => Ok(OrderResponse {
+                id: resp.order_id.to_string(),
+                symbol: resp.symbol,
+                status: resp.status,
+            }),
+            // Treat EXPIRED (IOC not met) or CANCELED as a failure
+            _ => Err(anyhow!(
+                "Order not filled (Slippage/IOC). Status: {}",
+                resp.status
+            )),
+        }
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<()> {
