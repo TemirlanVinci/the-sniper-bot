@@ -12,27 +12,35 @@ pub enum Side {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticker {
     pub symbol: String,
-    pub price: Decimal, // f64 -> Decimal
+    pub price: Decimal,     // Mid-Price для свечей
+    pub bid_price: Decimal, // Для точного входа
+    pub ask_price: Decimal,
+    pub bid_qty: Decimal, // Для OBI
+    pub ask_qty: Decimal, // Для OBI
     pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Signal {
-    Advice(Side, Decimal), // f64 -> Decimal
+    Advice(Side, Decimal),
     Hold,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: String,
-    pub quantity: Decimal,       // f64 -> Decimal
-    pub entry_price: Decimal,    // f64 -> Decimal
-    pub unrealized_pnl: Decimal, // f64 -> Decimal
+    pub quantity: Decimal,
+    pub entry_price: Decimal,
+    pub unrealized_pnl: Decimal,
+
+    // Новое поле для Trailing Stop
+    // Хранит максимальную цену с момента открытия (для Long)
+    pub highest_price: Decimal,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct Inventory {
-    pub quote_balance: Decimal, // f64 -> Decimal
+    pub quote_balance: Decimal,
     pub positions: HashMap<String, Position>,
 }
 

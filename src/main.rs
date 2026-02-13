@@ -6,6 +6,7 @@ use crate::strategies::scalper::RsiBollingerStrategy;
 use dotenvy::dotenv;
 use std::env;
 use tokio::sync::mpsc;
+use tracing::{error, info};
 use tracing_appender::rolling;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
@@ -21,18 +22,15 @@ async fn main() -> anyhow::Result<()> {
     dotenv().ok();
 
     // --- 1. Async Non-blocking Logging ---
-    // Логи пишутся в файлы: logs/sniper.log.YYYY-MM-DD
     let file_appender = rolling::daily("logs", "sniper.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    // Дублируем логи: в файл и в stderr (если не TUI)
-    // Так как у нас TUI, лучше писать ТОЛЬКО в файл, чтобы не ломать интерфейс.
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
-        .with_ansi(false) // Отключаем цвета для файла
+        .with_ansi(false)
         .init();
 
-    tracing::info!("Starting The Sniper Bot (Refactored Core)...");
+    info!("Starting The Sniper Bot (Futures Edition)...");
 
     let api_key = env::var("BINANCE_API_KEY").unwrap_or_default();
     let secret_key = env::var("BINANCE_SECRET_KEY").unwrap_or_default();
@@ -45,12 +43,24 @@ async fn main() -> anyhow::Result<()> {
 
     // --- 2. Setup Clients & Channels ---
     let mut binance_client = BinanceClient::new(api_key, secret_key);
-    // Клонируем клиент, так как он теперь ExecutionHandler + StreamClient
-    let execution_client = Box::new(binance_client.clone());
 
+    // ВАЖНО: Настройка Фьючерсов (Плечо 5x + Isolated Margin)
+    // Делаем это ДО клонирования клиента
+    if live_trading {
+        info!("Setting up Futures parameters for {}...", symbol);
+        match binance_client.init_futures_settings(symbol, 5).await {
+            Ok(_) => info!("Futures settings applied successfully."),
+            Err(e) => error!(
+                "Failed to set futures settings: {}. Continuing anyway...",
+                e
+            ),
+        }
+    }
+
+    let execution_client = Box::new(binance_client.clone());
     let strategy = RsiBollingerStrategy::new(symbol.to_string());
 
-    // Bounded Channel (Backpressure) - Capacity 100 ticks
+    // Bounded Channel (Backpressure)
     let (ticker_tx, ticker_rx) = mpsc::channel(100);
     // UI Channel
     let (ui_tx, ui_rx) = mpsc::channel(100);
@@ -70,12 +80,11 @@ async fn main() -> anyhow::Result<()> {
         );
 
         if let Err(e) = engine.run().await {
-            tracing::error!("FATAL Engine Error: {}", e);
+            error!("FATAL Engine Error: {}", e);
         }
     });
 
     // --- 5. Start TUI ---
-    // TUI работает в основном потоке
     tui::run(ui_rx, symbol.to_string()).await?;
 
     Ok(())
