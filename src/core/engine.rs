@@ -3,6 +3,9 @@ use crate::config::AppConfig;
 use crate::connectors::traits::ExecutionHandler;
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker, UiEvent};
+// --- ДОБАВЛЕН ИМПОРТ ---
+use crate::utils::precision::{normalize_price, normalize_quantity};
+// -----------------------
 use anyhow::Result;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
@@ -103,8 +106,6 @@ where
                     self.handle_signal(side, price, &ticker).await?;
                 }
                 Signal::StateChanged => {
-                    // <--- НОВОЕ: Обработка изменения состояния (без ордеров)
-                    // Получаем актуальную позицию из стратегии (там обновилась highest_price)
                     let current_pos = self.strategy.get_position();
                     self.save_state(current_pos).await;
                     info!("💾 State updated (highest_price tracked)");
@@ -129,24 +130,48 @@ where
             // Dynamic quantity calculation: USDT / price
             let order_usdt =
                 Decimal::from_f64(self.config.order_size_usdt).unwrap_or(Decimal::from(10));
-            let quantity = order_usdt / current_price;
+
+            // --- НОВАЯ ЛОГИКА НОРМАЛИЗАЦИИ (Paper Mode) ---
+            // Хардкод для симуляции (как указано в задаче для BTC)
+            let step_size = Decimal::from_str("0.001").unwrap(); // Шаг лота
+            let tick_size = Decimal::from_str("0.1").unwrap(); // Шаг цены
+
+            let raw_qty = order_usdt / current_price;
+            let quantity = normalize_quantity(raw_qty, step_size);
+            let limit_price = normalize_price(current_price, tick_size);
 
             let fake_pos = match side {
                 Side::Buy => {
-                    info!("Paper Buy: {} coins at ${}", quantity, current_price);
+                    info!(
+                        "Paper Buy: {} coins (Raw: {}) at ${} (Normalized from {})",
+                        quantity, raw_qty, limit_price, current_price
+                    );
+
+                    if quantity.is_zero() {
+                        warn!("⚠️ Quantity is zero after normalization. Not entering position.");
+                        return Ok(());
+                    }
+
                     Some(Position {
                         symbol: ticker.symbol.clone(),
                         quantity,
-                        entry_price: current_price,
+                        entry_price: limit_price,
                         unrealized_pnl: Decimal::ZERO,
-                        highest_price: current_price,
+                        highest_price: limit_price,
                     })
                 }
-                Side::Sell => None,
+                Side::Sell => {
+                    info!(
+                        "Paper Sell: Closing position at ${} (Normalized)",
+                        limit_price
+                    );
+                    None
+                }
             };
             self.strategy.update_position(fake_pos.clone());
             self.save_state(fake_pos).await;
             return Ok(());
+            // ---------------------------------------------
         }
 
         // --- LIVE EXECUTION LOGIC ---
