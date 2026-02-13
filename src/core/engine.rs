@@ -126,14 +126,22 @@ where
 
         if !self.live_mode {
             // Simulation logic
+            // Dynamic quantity calculation: USDT / price
+            let order_usdt =
+                Decimal::from_f64(self.config.order_size_usdt).unwrap_or(Decimal::from(10));
+            let quantity = order_usdt / current_price;
+
             let fake_pos = match side {
-                Side::Buy => Some(Position {
-                    symbol: ticker.symbol.clone(),
-                    quantity: Decimal::from_str("0.001").unwrap(),
-                    entry_price: current_price,
-                    unrealized_pnl: Decimal::ZERO,
-                    highest_price: current_price,
-                }),
+                Side::Buy => {
+                    info!("Paper Buy: {} coins at ${}", quantity, current_price);
+                    Some(Position {
+                        symbol: ticker.symbol.clone(),
+                        quantity,
+                        entry_price: current_price,
+                        unrealized_pnl: Decimal::ZERO,
+                        highest_price: current_price,
+                    })
+                }
                 Side::Sell => None,
             };
             self.strategy.update_position(fake_pos.clone());
