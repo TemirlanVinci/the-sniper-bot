@@ -1,5 +1,6 @@
 // src/connectors/binance.rs
-use crate::connectors::traits::{ExchangeClient, StreamClient};
+use crate::connectors::messages::BinanceTradeEvent;
+use crate::connectors::traits::{ExecutionHandler, StreamClient};
 use crate::types::{OrderResponse, Side, Ticker};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -7,17 +8,17 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
-use rust_decimal::prelude::*; // Для парсинга и методов
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
-use tracing::{error, info}; // Non-blocking I/O
+use tracing::{error, info, warn};
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Clone)]
 pub struct BinanceClient {
     api_key: String,
     secret_key: String,
@@ -74,48 +75,35 @@ impl BinanceClient {
 }
 
 #[async_trait]
-impl ExchangeClient for BinanceClient {
-    async fn connect(&mut self) -> Result<()> {
-        let url = format!("{}/api/v3/ping", self.base_rest_url);
-        self.http_client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
-    }
+impl ExecutionHandler for BinanceClient {
+    async fn get_balance(&self, asset: &str) -> Result<Decimal> {
+        #[derive(Deserialize)]
+        struct Balance {
+            asset: String,
+            free: String,
+        }
+        #[derive(Deserialize)]
+        struct AccountInfo {
+            balances: Vec<Balance>,
+        }
 
-    async fn fetch_price(&self, symbol: &str) -> Result<Ticker> {
-        let url = format!(
-            "{}/api/v3/ticker/price?symbol={}",
-            self.base_rest_url, symbol
-        );
-        let resp = self
-            .http_client
-            .get(&url)
-            .send()
-            .await?
-            .json::<serde_json::Value>()
+        let resp: AccountInfo = self
+            .send_signed_request(Method::GET, "/api/v3/account", vec![])
             .await?;
 
-        let price_str = resp
-            .get("price")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Failed to parse price for {}", symbol))?;
+        let balance = resp
+            .balances
+            .iter()
+            .find(|b| b.asset == asset)
+            .ok_or_else(|| anyhow!("Asset {} not found", asset))?;
 
-        // Парсинг в Decimal
-        let price = Decimal::from_str(price_str)?;
-
-        Ok(Ticker {
-            symbol: symbol.to_string(),
-            price,
-            timestamp: Utc::now().timestamp_millis() as u64,
-        })
+        // Используем parse для Decimal, избегая float
+        balance.free.parse::<Decimal>().map_err(|e| anyhow!(e))
     }
 
     async fn place_order(
         &self,
-        pair: &str,
+        symbol: &str,
         side: Side,
         amount: Decimal,
         price: Option<Decimal>,
@@ -125,25 +113,13 @@ impl ExchangeClient for BinanceClient {
             Side::Sell => "SELL",
         };
 
-        // Slippage Protection & FOK/IOC Logic
         let (type_str, time_in_force, price_val) = match price {
-            Some(p) => {
-                // Если цена есть, используем LIMIT IOC (Immediate Or Cancel)
-                // Это защищает от зависания ордера (Maker) и гарантирует исполнение или отмену
-                ("LIMIT", Some("IOC"), Some(p))
-            }
-            None => {
-                // Если цены нет, БЛОКИРУЕМ отправку "голого" маркета в HFT контексте
-                // Либо можно реализовать тут же запрос цены, но это задержка.
-                // Движок (Engine) должен был рассчитать цену.
-                // Fallback: Market (не рекомендуется, но для совместимости оставим с варнингом)
-                error!("⚠️ WARNING: Sending MARKET order without protection!");
-                ("MARKET", None, None)
-            }
+            Some(p) => ("LIMIT", Some("IOC"), Some(p)),
+            None => ("MARKET", None, None),
         };
 
         let mut params = vec![
-            ("symbol", pair.to_string()),
+            ("symbol", symbol.to_string()),
             ("side", side_str.to_string()),
             ("type", type_str.to_string()),
             ("quantity", amount.to_string()),
@@ -164,11 +140,6 @@ impl ExchangeClient for BinanceClient {
             status: String,
         }
 
-        info!(
-            "🚀 Sending Order: {} {} {} @ {:?}",
-            side_str, amount, pair, price_val
-        );
-
         let resp: BinanceOrderResponse = self
             .send_signed_request(Method::POST, "/api/v3/order", params)
             .await?;
@@ -180,33 +151,15 @@ impl ExchangeClient for BinanceClient {
         })
     }
 
-    async fn get_balance(&self, asset: &str) -> Result<Decimal> {
-        #[derive(Deserialize)]
-        struct Balance {
-            asset: String,
-            free: String,
-        }
-        #[derive(Deserialize)]
-        struct AccountInfo {
-            balances: Vec<Balance>,
-        }
-
-        let resp: AccountInfo = self
-            .send_signed_request(Method::GET, "/api/v3/account", vec![])
+    async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<()> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("orderId", order_id.to_string()),
+        ];
+        let _: serde_json::Value = self
+            .send_signed_request(Method::DELETE, "/api/v3/order", params)
             .await?;
-
-        let balance = resp
-            .balances
-            .iter()
-            .find(|b| b.asset == asset)
-            .ok_or_else(|| anyhow!("Asset {} not found in account", asset))?;
-
-        Ok(Decimal::from_str(&balance.free)?)
-    }
-
-    async fn get_open_orders(&self, _pair: &str) -> Result<Vec<OrderResponse>> {
-        // ... (implementation same but updated tracing if needed, abbreviated for length)
-        Ok(vec![])
+        Ok(())
     }
 }
 
@@ -219,42 +172,57 @@ impl StreamClient for BinanceClient {
         );
         let url = Url::parse(&ws_url)?;
 
-        info!("Starting WebSocket task for: {}", symbol);
+        info!("Starting WebSocket task (Hot Path) for: {}", symbol);
+        let symbol_clone = symbol.to_string();
 
-        let symbol = symbol.to_string();
         tokio::spawn(async move {
-            match connect_async(url).await {
-                Ok((ws_stream, _)) => {
-                    let (_, mut read) = ws_stream.split();
-                    info!("WebSocket connected for {}", symbol);
+            loop {
+                match connect_async(url.clone()).await {
+                    Ok((ws_stream, _)) => {
+                        info!("WebSocket connected: {}", symbol_clone);
+                        let (_, mut read) = ws_stream.split();
 
-                    while let Some(message) = read.next().await {
-                        match message {
-                            Ok(msg) => {
-                                if let Ok(text) = msg.to_text() {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-                                        if let Some(price_str) = v.get("p").and_then(|p| p.as_str())
-                                        {
-                                            // Парсинг Decimal
-                                            if let Ok(price) = Decimal::from_str(price_str) {
+                        while let Some(msg_result) = read.next().await {
+                            match msg_result {
+                                Ok(msg) => {
+                                    if let Ok(text) = msg.to_text() {
+                                        // 1. Hot Path Optimization: Deserialization
+                                        match serde_json::from_str::<BinanceTradeEvent>(text) {
+                                            Ok(event) => {
                                                 let ticker = Ticker {
-                                                    symbol: symbol.clone(),
-                                                    price,
-                                                    timestamp: Utc::now().timestamp_millis() as u64,
+                                                    symbol: symbol_clone.clone(),
+                                                    price: event.price,
+                                                    timestamp: event.event_time,
                                                 };
-                                                let _ = sender.send(ticker).await;
+
+                                                // 2. Backpressure: Drop ticks if channel is full
+                                                if let Err(mpsc::error::TrySendError::Full(_)) =
+                                                    sender.try_send(ticker)
+                                                {
+                                                    // Логируем редко или используем метрики, чтобы не спамить в логи
+                                                    // warn!("Channel full! Dropping tick for {}", symbol_clone);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                // Log deserialization errors only occasionally or debug
+                                                error!("Deserialization error: {}", e);
                                             }
                                         }
                                     }
                                 }
+                                Err(e) => {
+                                    error!("WebSocket read error: {}", e);
+                                    break; // Reconnect
+                                }
                             }
-                            Err(e) => error!("WebSocket Error for {}: {}", symbol, e),
                         }
                     }
+                    Err(e) => {
+                        error!("Failed to connect WS: {}. Retrying in 5s...", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    }
                 }
-                Err(e) => error!("Failed to connect WebSocket for {}: {}", symbol, e),
             }
-            info!("WebSocket task finished for {}", symbol);
         });
 
         Ok(())

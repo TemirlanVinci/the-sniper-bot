@@ -5,25 +5,24 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 
+/// Трейт для получения рыночных данных (Market Data)
 #[async_trait]
-pub trait ExchangeClient {
-    async fn connect(&mut self) -> Result<()>;
-    async fn fetch_price(&self, symbol: &str) -> Result<Ticker>;
-
-    // amount и price теперь Decimal. price обязателен для LIMIT IOC.
-    async fn place_order(
-        &self,
-        pair: &str,
-        side: Side,
-        amount: Decimal,
-        price: Option<Decimal>,
-    ) -> Result<OrderResponse>;
-
-    async fn get_balance(&self, asset: &str) -> Result<Decimal>;
-    async fn get_open_orders(&self, pair: &str) -> Result<Vec<OrderResponse>>;
+pub trait StreamClient: Send + Sync {
+    async fn subscribe_ticker(&mut self, symbol: &str, sender: mpsc::Sender<Ticker>) -> Result<()>;
 }
 
+/// Трейт для исполнения ордеров (Execution)
 #[async_trait]
-pub trait StreamClient {
-    async fn subscribe_ticker(&mut self, symbol: &str, sender: mpsc::Sender<Ticker>) -> Result<()>;
+pub trait ExecutionHandler: Send + Sync {
+    async fn get_balance(&self, asset: &str) -> Result<Decimal>;
+
+    async fn place_order(
+        &self,
+        symbol: &str,
+        side: Side,
+        amount: Decimal,
+        price: Option<Decimal>, // Если Some -> LIMIT IOC, если None -> MARKET (use cautiously)
+    ) -> Result<OrderResponse>;
+
+    async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<()>;
 }

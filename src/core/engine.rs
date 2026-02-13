@@ -1,186 +1,186 @@
 // src/core/engine.rs
-use crate::connectors::traits::ExchangeClient;
+use crate::connectors::traits::ExecutionHandler;
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker, UiEvent};
 use anyhow::Result;
-use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::str::FromStr; // <--- ВАЖНО: Нужен для Decimal::from_str
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info}; // Убрал unused 'warn'
 
-pub struct TradingEngine<E, S> {
-    exchange: E,
+// Простое персистентное состояние
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct EngineState {
+    active_position: Option<Position>,
+}
+
+pub struct TradingEngine<S> {
+    execution_handler: Box<dyn ExecutionHandler>,
     strategy: S,
     ticker_receiver: mpsc::Receiver<Ticker>,
     ui_sender: mpsc::Sender<UiEvent>,
     live_mode: bool,
+    state_file: String,
 }
 
-impl<E, S> TradingEngine<E, S>
+impl<S> TradingEngine<S>
 where
-    E: ExchangeClient + Send,
     S: Strategy,
 {
     pub fn new(
-        exchange: E,
+        execution_handler: Box<dyn ExecutionHandler>,
         strategy: S,
         ticker_receiver: mpsc::Receiver<Ticker>,
         ui_sender: mpsc::Sender<UiEvent>,
         live_mode: bool,
     ) -> Self {
         Self {
-            exchange,
+            execution_handler,
             strategy,
             ticker_receiver,
             ui_sender,
             live_mode,
+            state_file: "bot_state.json".to_string(),
+        }
+    }
+
+    fn load_state(&mut self) {
+        if let Ok(data) = fs::read_to_string(&self.state_file) {
+            if let Ok(state) = serde_json::from_str::<EngineState>(&data) {
+                info!("Restored state: {:?}", state);
+                self.strategy.update_position(state.active_position);
+            }
+        }
+    }
+
+    fn save_state(&self, position: Option<Position>) {
+        let state = EngineState {
+            active_position: position,
+        };
+        if let Ok(data) = serde_json::to_string_pretty(&state) {
+            let _ = fs::write(&self.state_file, data);
         }
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let mode = if self.live_mode {
-            "🚨 LIVE"
-        } else {
-            "📝 SIMULATION"
-        };
-        info!("Engine started ({})", mode);
-        let _ = self
-            .ui_sender
-            .send(UiEvent::Log(format!("Engine started ({})", mode)))
-            .await;
-
+        info!("Engine starting...");
+        self.load_state();
         self.strategy.init().await?;
 
+        info!("Engine loop running. Live Mode: {}", self.live_mode);
+
         while let Some(ticker) = self.ticker_receiver.recv().await {
+            // Forward ticker to UI
             let _ = self
                 .ui_sender
                 .send(UiEvent::TickerUpdate(ticker.clone()))
                 .await;
 
+            // Strategy Tick
             let signal = self.strategy.on_tick(&ticker).await?;
 
             match signal {
-                Signal::Advice(side, current_price) => {
-                    info!("Signal received: {:?} at ${}", side, current_price);
-                    let _ = self
-                        .ui_sender
-                        .send(UiEvent::Signal(Signal::Advice(side, current_price)))
-                        .await;
-
-                    if self.live_mode {
-                        let quantity = Decimal::from_str("0.0002").unwrap();
-
-                        // --- 1. BALANCE CHECK (Requirement #4) ---
-                        // Предполагаем пару BTCUSDT. Buy -> нужен USDT, Sell -> нужен BTC.
-                        // В реальном коде нужно парсить символ.
-                        let required_asset = match side {
-                            Side::Buy => "USDT",
-                            Side::Sell => "BTC",
-                        };
-
-                        match self.exchange.get_balance(required_asset).await {
-                            Ok(balance) => {
-                                let required_amount = match side {
-                                    Side::Buy => quantity * current_price,
-                                    Side::Sell => quantity,
-                                };
-
-                                if balance < required_amount {
-                                    error!(
-                                        "❌ INSUFFICIENT FUNDS: Have {} {}, Need {}",
-                                        balance, required_asset, required_amount
-                                    );
-                                    let _ = self
-                                        .ui_sender
-                                        .send(UiEvent::Log(format!(
-                                            "❌ NO FUNDS: {}",
-                                            required_asset
-                                        )))
-                                        .await;
-                                    continue; // Skip execution
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to check balance: {}", e);
-                                continue;
-                            }
-                        }
-
-                        // --- 2. SLIPPAGE PROTECTION & LIMIT PRICE (Requirement #3) ---
-                        // Рассчитываем Limit цену:
-                        // Buy: Текущая + 0.1%
-                        // Sell: Текущая - 0.1%
-                        let slip_pct = Decimal::from_str("0.001").unwrap(); // 0.1%
-                        let limit_price = match side {
-                            Side::Buy => current_price * (Decimal::ONE + slip_pct),
-                            Side::Sell => current_price * (Decimal::ONE - slip_pct),
-                        };
-                        let limit_price = limit_price.round_dp(2); // Округление до 2 знаков (для BTCUSDT)
-
-                        info!("Executing LIVE {:?} with Limit Price {}", side, limit_price);
-
-                        match self
-                            .exchange
-                            .place_order(&ticker.symbol, side, quantity, Some(limit_price))
-                            .await
-                        {
-                            Ok(order) => {
-                                info!("✅ ORDER FILLED: {}", order.id);
-                                let _ = self
-                                    .ui_sender
-                                    .send(UiEvent::Log(format!("✅ FILLED: {}", order.id)))
-                                    .await;
-
-                                // Update Strategy State
-                                match side {
-                                    Side::Buy => {
-                                        let position = Position {
-                                            symbol: ticker.symbol.clone(),
-                                            quantity,
-                                            entry_price: order
-                                                .status
-                                                .eq("FILLED")
-                                                .then(|| limit_price)
-                                                .unwrap_or(current_price),
-                                            unrealized_pnl: Decimal::ZERO,
-                                        };
-                                        self.strategy.update_position(Some(position));
-                                    }
-                                    Side::Sell => {
-                                        self.strategy.update_position(None);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("❌ ORDER FAILED: {}", e);
-                                let _ = self
-                                    .ui_sender
-                                    .send(UiEvent::Log(format!("❌ FAILED: {}", e)))
-                                    .await;
-                            }
-                        }
-                    } else {
-                        // Simulation Logic
-                        let quantity = Decimal::from_str("0.001").unwrap();
-                        match side {
-                            Side::Buy => {
-                                let position = Position {
-                                    symbol: ticker.symbol.clone(),
-                                    quantity,
-                                    entry_price: current_price,
-                                    unrealized_pnl: Decimal::ZERO,
-                                };
-                                self.strategy.update_position(Some(position));
-                            }
-                            Side::Sell => {
-                                self.strategy.update_position(None);
-                            }
-                        }
-                    }
+                Signal::Advice(side, price) => {
+                    self.handle_signal(side, price, &ticker).await?;
                 }
                 Signal::Hold => {}
             }
         }
+        Ok(())
+    }
+
+    async fn handle_signal(
+        &mut self,
+        side: Side,
+        current_price: Decimal,
+        ticker: &Ticker,
+    ) -> Result<()> {
+        info!("Signal detected: {:?} @ {}", side, current_price);
+        let _ = self
+            .ui_sender
+            .send(UiEvent::Signal(Signal::Advice(side, current_price)))
+            .await;
+
+        if !self.live_mode {
+            // Simulation
+            let fake_pos = match side {
+                Side::Buy => Some(Position {
+                    symbol: ticker.symbol.clone(),
+                    quantity: Decimal::from_str("0.001").unwrap(), // Исправлено (но лучше вынести в константу)
+                    entry_price: current_price,
+                    unrealized_pnl: Decimal::ZERO,
+                }),
+                Side::Sell => None,
+            };
+            self.strategy.update_position(fake_pos.clone());
+            self.save_state(fake_pos);
+            return Ok(());
+        }
+
+        // --- LIVE EXECUTION LOGIC ---
+        // TODO: Перенести размер лота в конфиг
+        let quantity = Decimal::from_str("0.0002").unwrap();
+
+        let required_asset = match side {
+            Side::Buy => "USDT",
+            Side::Sell => "BTC", // TODO: Extract from symbol logic
+        };
+
+        // 1. Balance Check
+        let balance = self
+            .execution_handler
+            .get_balance(required_asset)
+            .await
+            .unwrap_or(Decimal::ZERO);
+        let required_amt = match side {
+            Side::Buy => quantity * current_price,
+            Side::Sell => quantity,
+        };
+
+        if balance < required_amt {
+            error!("Insufficient balance: {} < {}", balance, required_amt);
+            return Ok(());
+        }
+
+        // 2. Place Order (Limit IOC)
+        let slippage = Decimal::from_str("0.001").unwrap(); // 0.1%
+        let limit_price = match side {
+            Side::Buy => current_price * (Decimal::ONE + slippage),
+            Side::Sell => current_price * (Decimal::ONE - slippage),
+        };
+        let limit_price = limit_price.round_dp(2);
+
+        match self
+            .execution_handler
+            .place_order(&ticker.symbol, side, quantity, Some(limit_price))
+            .await
+        {
+            Ok(order) => {
+                info!("Order Filled: {:?}", order);
+                match side {
+                    Side::Buy => {
+                        let pos = Position {
+                            symbol: ticker.symbol.clone(),
+                            quantity,
+                            entry_price: limit_price, // Approx
+                            unrealized_pnl: Decimal::ZERO,
+                        };
+                        self.strategy.update_position(Some(pos.clone()));
+                        self.save_state(Some(pos));
+                    }
+                    Side::Sell => {
+                        self.strategy.update_position(None);
+                        self.save_state(None);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Execution failed: {}", e);
+            }
+        }
+
         Ok(())
     }
 }
