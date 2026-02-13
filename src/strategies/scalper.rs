@@ -1,4 +1,4 @@
-use crate::config::StrategyConfig; // <--- Добавили импорт конфига
+use crate::config::StrategyConfig;
 use crate::strategies::traits::Strategy;
 use crate::types::{Position, Side, Signal, Ticker};
 use anyhow::Result;
@@ -7,7 +7,7 @@ use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use ta::indicators::{BollingerBands, RelativeStrengthIndex};
 use ta::{DataItem, Next};
-use tracing::info;
+use tracing::{debug, info}; // Added debug for warm-up logging
 
 #[derive(Debug, Clone)]
 struct CandleBuilder {
@@ -50,17 +50,19 @@ pub struct RsiBollingerStrategy {
     last_bb_values: Option<(f64, f64, f64)>,
     position: Option<Position>,
 
-    // Параметры
+    // Warm-up Logic
+    warmup_period: usize,
+    processed_candles: usize,
+
+    // Strategy Parameters
     obi_threshold: Decimal,
     trailing_callback: Decimal,
 }
 
 impl RsiBollingerStrategy {
-    // ОБНОВЛЕНО: Добавили аргумент config: StrategyConfig
     pub fn new(symbol: String, config: StrategyConfig) -> Self {
         Self {
             symbol,
-            // Используем настройки из конфига
             rsi: RelativeStrengthIndex::new(config.rsi_period).unwrap(),
             bb: BollingerBands::new(config.bb_period, config.bb_std_dev).unwrap(),
 
@@ -69,10 +71,11 @@ impl RsiBollingerStrategy {
             last_bb_values: None,
             position: None,
 
-            // Конвертируем f64 из конфига в Decimal
-            obi_threshold: Decimal::from_f64(config.obi_threshold).unwrap_or(Decimal::ZERO),
+            // Warm-up initialization
+            warmup_period: 50, // Default to 50 candles as requested
+            processed_candles: 0,
 
-            // Этот параметр пока оставил хардкодом (0.2%), можно тоже вынести в конфиг позже
+            obi_threshold: Decimal::from_f64(config.obi_threshold).unwrap_or(Decimal::ZERO),
             trailing_callback: Decimal::from_str("0.002").unwrap(),
         }
     }
@@ -87,9 +90,13 @@ impl RsiBollingerStrategy {
             .build()
             .unwrap();
 
+        // Safety: Indicators are updated REGARDLESS of warm-up state to fill internal buffers
         self.last_rsi_value = self.rsi.next(&item);
         let bb_out = self.bb.next(&item);
         self.last_bb_values = Some((bb_out.lower, bb_out.average, bb_out.upper));
+
+        // Increment the count of valid historical points
+        self.processed_candles += 1;
     }
 }
 
@@ -101,15 +108,15 @@ impl Strategy for RsiBollingerStrategy {
 
     async fn init(&mut self) -> Result<()> {
         info!(
-            "🚀 Strategy {} initialized with OBI Thresh: {}",
+            "🚀 Strategy {} initialized. Warm-up target: {} candles.",
             self.name(),
-            self.obi_threshold
+            self.warmup_period
         );
         Ok(())
     }
 
     async fn on_tick(&mut self, tick: &Ticker) -> Result<Signal> {
-        // 1. Candle Logic
+        // 1. Candle Logic (Updates Indicators)
         let tick_minute_start = (tick.timestamp / 60_000) * 60_000;
         match self.current_candle.clone() {
             Some(mut candle) => {
@@ -126,13 +133,23 @@ impl Strategy for RsiBollingerStrategy {
             }
         }
 
+        // 2. Warm-up Check: Suppress signals until indicators are statistically valid
+        if self.processed_candles < self.warmup_period {
+            debug!(
+                "Warming up: {} / {} candles processed",
+                self.processed_candles, self.warmup_period
+            );
+            return Ok(Signal::Hold);
+        }
+
+        // 3. Indicator Extraction
         let (bb_lower_f, _bb_mid_f, _bb_upper_f) = match self.last_bb_values {
             Some(vals) => vals,
             None => return Ok(Signal::Hold),
         };
         let bb_lower = Decimal::from_f64(bb_lower_f).unwrap_or_default();
 
-        // 2. OBI Calculation
+        // 4. OBI Calculation
         let total_qty = tick.bid_qty + tick.ask_qty;
         let obi = if !total_qty.is_zero() {
             (tick.bid_qty - tick.ask_qty) / total_qty
@@ -140,6 +157,7 @@ impl Strategy for RsiBollingerStrategy {
             Decimal::ZERO
         };
 
+        // 5. Entry/Exit Logic
         match &mut self.position {
             None => {
                 // ENTRY LOGIC
@@ -152,7 +170,7 @@ impl Strategy for RsiBollingerStrategy {
                 }
             }
             Some(pos) => {
-                // 3. TRAILING STOP LOGIC
+                // TRAILING STOP LOGIC
                 if tick.price > pos.highest_price {
                     pos.highest_price = tick.price;
                 }
